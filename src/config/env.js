@@ -1,5 +1,12 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
-dotenv.config();
+
+/* The server folder, found from this file rather than from the current
+   directory, so a process manager can start the API from anywhere and
+   it still finds its .env and its uploads folder. */
+export const SERVER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+dotenv.config({ path: path.join(SERVER_ROOT, '.env') });
 
 const need = (k, fallback) => {
   const v = process.env[k] ?? fallback;
@@ -10,7 +17,7 @@ const need = (k, fallback) => {
 export const env = {
   nodeEnv:  process.env.NODE_ENV || 'development',
   port:     Number(process.env.PORT || 5050),
-  mongoUri: need('MONGO_URI', 'mongodb://127.0.0.1:27017/examgenix'),
+  mongoUri: need('MONGO_URI', 'mongodb://127.0.0.1:27017/testprobe'),
   accessSecret:  need('JWT_ACCESS_SECRET', 'dev-access-secret'),
   refreshSecret: need('JWT_REFRESH_SECRET', 'dev-refresh-secret'),
   accessTtl:  process.env.ACCESS_TTL  || '15m',

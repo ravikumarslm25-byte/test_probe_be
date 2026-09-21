@@ -4,6 +4,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
 
 import { env, isProd } from './config/env.js';
 import { connectDb } from './config/db.js';
@@ -34,9 +35,23 @@ app.use(express.json({ limit: '25mb' }));   // identity captures and scan pages 
 app.use(cookieParser());
 app.use(morgan(isProd ? 'combined' : 'dev'));
 
+/* Limited per signed-in person, not per IP address. A college lab puts
+   thirty candidates behind one public address, and a per-IP limit would
+   start refusing their autosaves mid-paper. The token is verified before
+   it is used as a key — an unverified one could be forged to get a fresh
+   allowance on every request. Sign-in has its own stricter limiter. */
+const rateKey = (req) => {
+  const h = req.headers.authorization || '';
+  if (h.startsWith('Bearer ')) {
+    try { return `u:${jwt.verify(h.slice(7), env.accessSecret).sub}`; } catch { /* fall through */ }
+  }
+  return `ip:${req.ip}`;
+};
+
 app.use('/api', rateLimit({
   windowMs: 60 * 1000,
-  limit: 300,
+  limit: (req) => (rateKey(req).startsWith('u:') ? 600 : 300),
+  keyGenerator: rateKey,
   standardHeaders: true,
   legacyHeaders: false,
 }));
@@ -48,7 +63,7 @@ if (process.env.STORAGE_DRIVER !== 's3') {
 }
 
 app.get('/api/health', (_req, res) => res.json({
-  ok: true, service: 'examgenix', version: '0.1.0',
+  ok: true, service: 'testprobe', version: '0.1.0',
   time: new Date().toISOString(),
   live: liveStats(),
 }));
@@ -98,7 +113,7 @@ const start = async () => {
   await connectDb();
   await syncSystemRoles();
   const server = app.listen(env.port, () => {
-    console.log(`[api] ExamGeniX listening on http://localhost:${env.port}/api`);
+    console.log(`[api] Test Probe listening on http://localhost:${env.port}/api`);
   });
   attachRealtime(server);
 };

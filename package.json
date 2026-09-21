@@ -1,5 +1,5 @@
 {
-  "name": "examgenix-server",
+  "name": "testprobe-server",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,7 +7,12 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "seed": "node src/seed/seed.js",
-    "check-db": "node src/seed/check.js"
+    "check-db": "node src/seed/check.js",
+    "prod:start": "mkdir -p logs && NODE_ENV=production forever start --uid testprobe-api --minUptime 1000 --spinSleepTime 1000 -a -o \"$PWD/logs/out.log\" -e \"$PWD/logs/err.log\" src/index.js",
+    "prod:restart": "forever restart testprobe-api",
+    "prod:stop": "forever stop testprobe-api",
+    "prod:logs": "tail -n 100 -f logs/out.log logs/err.log",
+    "prod:status": "forever list"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -15,7 +15,7 @@ function inspectUri(uri) {
   const dbName = afterHost.split('?')[0];
   if (!dbName) {
     notes.push('No database name in the connection string, so Mongo is using "test".');
-    notes.push('Add /examgenix before the ? to name it — but note that anything already');
+    notes.push('Add /examprobe before the ? to name it — but note that anything already');
     notes.push('seeded went into "test", so you would need to run the seed again afterwards.');
   }
 

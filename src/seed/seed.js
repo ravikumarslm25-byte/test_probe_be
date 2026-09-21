@@ -9,7 +9,10 @@ import { SYSTEM_ROLES } from '../utils/permissions.js';
 import { samplePaper } from '../data/sample-bank.js';
 
 const AY = '2026-27';
-const PW = 'Examgenix@2026';
+/* Demo password for every seeded account. Local development uses a
+   default; a production seed must set its own, so a publicly reachable
+   server never carries a password printed in this repository. */
+const PW = process.env.SEED_PASSWORD || 'TestProbe@2026';
 
 const FIRST = ['Keerthana','Aravind','Divya','Surya','Nandhini','Karthik','Priyadharshini','Vignesh','Sandhiya','Mohan','Abinaya','Hariharan','Swetha','Gokul','Janani','Prasanth','Meenakshi','Rahul','Deepika','Ashwin','Yazhini','Naveen','Kavya','Balaji','Sneha','Manoj','Ramya','Vishal','Anitha','Sathish','Bhavana','Dinesh','Harini','Jeyanth','Kalaiselvi','Lokesh','Monisha','Nithish','Pavithra','Raghul'];
 const LAST = ['R','S','K','M','P','V','A','N','T','B'];
@@ -19,11 +22,29 @@ const hash = (p) => bcrypt.hash(p, 10);
 /* Refuses to wipe a database that already holds data unless the
    operator says so explicitly. Losing a real institution's exam
    records to a stray `npm run seed` is not a recoverable mistake. */
-async function guard() {
+/* Runs before any connection is made, so a refused production seed
+   says so at once instead of after a database timeout. */
+function preflight() {
+  /* Production is allowed only on purpose: an explicit flag, and a
+     password of the operator's own choosing. The empty-database check
+     below still applies on top of this. */
   if (process.env.NODE_ENV === 'production') {
-    console.error('[seed] refusing to run with NODE_ENV=production');
-    process.exit(1);
+    const allowed = process.argv.includes('--allow-production');
+    if (!allowed) {
+      console.error('\n[seed] NODE_ENV is production. Seeding creates demo accounts with a shared password.');
+      console.error('       To set up a demonstration server on purpose, run:');
+      console.error('         SEED_PASSWORD=\'a-strong-password\' npm run seed -- --allow-production\n');
+      process.exit(1);
+    }
+    if (!process.env.SEED_PASSWORD || process.env.SEED_PASSWORD.length < 10) {
+      console.error('\n[seed] a production seed needs SEED_PASSWORD of at least 10 characters.\n');
+      process.exit(1);
+    }
+    console.log('[seed] production seed confirmed (--allow-production)');
   }
+}
+
+async function guard() {
 
   const counts = await Promise.all([
     Institution.countDocuments(), Student.countDocuments(), Attempt.countDocuments(),
@@ -55,6 +76,7 @@ async function wipe() {
 
 async function run() {
   const t0 = Date.now();
+  preflight();
   await connectDb();
   await guard();
   await wipe();
@@ -294,7 +316,7 @@ async function run() {
   ]);
 
   console.log('\n──────────────────────────────────────────');
-  console.log(` ExamGeniX seed complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  console.log(` Test Probe seed complete in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   console.log('──────────────────────────────────────────');
   console.log(' Staff sign in (all use the same password):');
   staffSpecs.forEach(([, name, email, , r]) => console.log(`   ${email.padEnd(34)} ${r.join(', ')}`));

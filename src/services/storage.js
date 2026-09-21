@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { env } from '../config/env.js';
+import { env, SERVER_ROOT } from '../config/env.js';
 
 /* ============================================================
    Evidence storage.
@@ -14,7 +14,7 @@ import { env } from '../config/env.js';
    STORAGE_DRIVER=s3     → needs AWS_* and S3_BUCKET
    ============================================================ */
 
-const ROOT = path.resolve(process.cwd(), 'uploads');
+const ROOT = path.join(SERVER_ROOT, 'uploads');
 
 const KIND_RULES = {
   face:     { max: 2_000_000,  types: ['image/jpeg', 'image/png', 'image/webp'] },

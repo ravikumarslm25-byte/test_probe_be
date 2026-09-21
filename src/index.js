@@ -28,7 +28,11 @@ import scheduleRoutes from './routes/schedule.routes.js';
 
 const app = express();
 
-app.set('trust proxy', 1);
+/* How many proxies sit in front of the API. nginx alone is 1; CloudFront
+   in front of nginx is 2. Too low, and every request appears to come from
+   the proxy — the candidate's recorded IP becomes CloudFront's, and the
+   per-address rate limit lumps together everyone on the same edge. */
+app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin: env.corsOrigins, credentials: true }));
 app.use(express.json({ limit: '25mb' }));   // identity captures and scan pages arrive as data URLs

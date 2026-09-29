@@ -5,6 +5,7 @@ import { authenticate, can, tenant, studentOnly } from '../middleware/auth.js';
 import { audit } from '../middleware/audit.js';
 import { wrap, notFound, forbidden, badRequest } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
+import { examStartAt } from '../utils/time.js';
 
 const r = Router();
 r.use(authenticate);
@@ -27,7 +28,7 @@ function derivePriority(category, exam) {
   if (['result', 'other'].includes(category)) return 'low';
   if (!exam) return 'medium';
 
-  const startAt = new Date(`${exam.date}T${exam.startTime}:00`);
+  const startAt = examStartAt(exam);
   const minutesAway = (startAt - now()) / 60000;
 
   if (category === 'access' || category === 'device') {

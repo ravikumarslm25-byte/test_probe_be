@@ -14,6 +14,36 @@ const need = (k, fallback) => {
   return v;
 };
 
+
+/* PUBLIC_URL is ONE address — where a browser reaches this API — and
+   it is what every proctoring capture is linked from. CORS_ORIGINS
+   beside it in the same file is a comma-separated list, and the two
+   get confused: a PUBLIC_URL of "https://api.example.com,http://localhost:5050"
+   produced evidence links with both hosts glued together, so every
+   capture in the timeline showed as a broken image. Take the first
+   address, drop anything after it, and complain loudly at boot. */
+function publicUrl() {
+  const raw = process.env.PUBLIC_URL;
+  const fallback = `http://localhost:${Number(process.env.PORT || 5050)}`;
+  if (!raw || !raw.trim()) return fallback;
+
+  const first = raw.split(',')[0].trim().replace(/\/+$/, '');
+  if (first !== raw.trim().replace(/\/+$/, '')) {
+    console.warn(`[env] PUBLIC_URL holds more than one address. Using "${first}".`);
+    console.warn('      PUBLIC_URL is a single address; CORS_ORIGINS is the list.');
+  }
+
+  try {
+    const u = new URL(first);
+    if (!['http:', 'https:'].includes(u.protocol)) throw new Error('protocol');
+  } catch {
+    console.warn(`[env] PUBLIC_URL "${first}" is not a valid address. Using ${fallback}.`);
+    console.warn('      Proctoring captures will not load until this is corrected.');
+    return fallback;
+  }
+  return first;
+}
+
 export const env = {
   nodeEnv:  process.env.NODE_ENV || 'development',
   port:     Number(process.env.PORT || 5050),
@@ -28,8 +58,7 @@ export const env = {
      local driver is served from here, so the URL has to be absolute —
      a relative path would resolve against the web app's origin, not
      the API's. */
-  publicUrl: (process.env.PUBLIC_URL || `http://localhost:${Number(process.env.PORT || 5050)}`)
-    .replace(/\/$/, ''),
+  publicUrl: publicUrl(),
 
   /* WebRTC. Public STUN is enough for a candidate and an invigilator on
      the same network, which covers a campus and covers testing. A TURN

@@ -12,7 +12,8 @@
     "prod:restart": "forever restart testprobe-api",
     "prod:stop": "forever stop testprobe-api",
     "prod:logs": "tail -n 100 -f logs/out.log logs/err.log",
-    "prod:status": "forever list"
+    "prod:status": "forever list",
+    "demo:refresh": "node src/seed/refresh.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

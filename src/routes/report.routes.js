@@ -7,6 +7,7 @@ import { authenticate, can, tenant, resolveScope } from '../middleware/auth.js';
 import { wrap, notFound, badRequest } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
 import { VIOLATION_CATALOGUE } from '../utils/grading.js';
+import { examStartAt } from '../utils/time.js';
 
 const r = Router();
 r.use(authenticate);
@@ -367,7 +368,7 @@ const builders = {
       const attempts = await Attempt.find({ examId: ex._id }).lean();
       const absent = attempts.filter((a) => a.status === 'not_started').length;
       const late = attempts.filter((a) =>
-        a.startedAt && new Date(a.startedAt) > new Date(`${ex.date}T${ex.startTime}:00`).getTime() + 15 * 60000).length;
+        a.startedAt && new Date(a.startedAt) > examStartAt(ex).getTime() + 15 * 60000).length;
 
       rows.push({
         date: ex.date,

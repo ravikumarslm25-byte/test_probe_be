@@ -18,6 +18,9 @@ const institutionSchema = new Schema({
   contactEmail: String,
 
   settings: {
+    /* Every examination date and time in this institution is a wall
+       clock reading in this zone, not on the server. */
+    timezone:                  { type: String, default: 'Asia/Kolkata' },
     verificationWindowMinutes: { type: Number, default: 15 },
     entryCutoffMinutes:        { type: Number, default: 15 },
     roomCapacity:              { type: Number, default: 30 },

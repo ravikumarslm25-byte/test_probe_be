@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Exam, Room, Attempt } from '../models/exam.js';
+import { Institution } from '../models/core.js';
 import { authenticate, can, tenant } from '../middleware/auth.js';
 import { audit } from '../middleware/audit.js';
 import { wrap, notFound, forbidden, badRequest } from '../utils/http.js';
@@ -8,6 +9,8 @@ import { parse } from '../utils/validate.js';
 import { storage } from '../services/storage.js';
 import { VIOLATION_CATALOGUE } from '../utils/grading.js';
 import { pushToCandidate } from '../realtime/live.js';
+import { examStartAt } from '../utils/time.js';
+import { syncExamStatuses } from '../utils/examStatus.js';
 
 const r = Router();
 r.use(authenticate);
@@ -33,11 +36,29 @@ r.get('/rooms', can('invigilation:view'), wrap(async (req, res) => {
   const { filter, wide } = await roomsForActor(req);
 
   const rooms = await Room.find(filter)
-    .populate('examId', 'title code date startTime durationMinutes status')
+    .populate('examId', 'title code date startTime durationMinutes status timezone startsAt')
     .populate('invigilatorId', 'name')
-    .sort({ startAt: -1 }).limit(60).lean();
+    .sort({ startAt: -1 }).limit(120).lean();
 
-  const live = rooms.filter((x) => x.examId && ['live', 'scheduled'].includes(x.examId.status));
+  /* Statuses are advanced before anything is classified, or a paper
+     whose window has passed still counts as live and keeps offering
+     an invigilator a wall of candidates who went home. */
+  const institution = await Institution.findById(req.actor.institutionId).lean();
+  const exams = [...new Map(rooms.filter((x) => x.examId)
+    .map((x) => [String(x.examId._id), x.examId])).values()];
+  await syncExamStatuses(Exam, exams, institution);
+
+  /* Three groups an invigilator understands: what is being sat now,
+     what is about to be, and what is over and only reviewable. */
+  const phaseOf = (exam) => {
+    if (!exam) return 'past';
+    if (exam.status === 'live') return 'live';
+    if (exam.status === 'scheduled') return 'upcoming';
+    return 'past';
+  };
+  for (const x of rooms) x.phase = phaseOf(x.examId);
+
+  const live = rooms.filter((x) => x.phase === 'live');
 
   const counts = await Attempt.aggregate([
     { $match: { roomId: { $in: rooms.map((x) => x._id) } } },
@@ -58,10 +79,12 @@ r.get('/rooms', can('invigilation:view'), wrap(async (req, res) => {
       name: x.name,
       startAt: x.startAt, endAt: x.endAt,
       invigilator: x.invigilatorId ? { id: String(x.invigilatorId._id), name: x.invigilatorId.name } : null,
+      phase: x.phase,
       exam: x.examId ? {
         id: String(x.examId._id), title: x.examId.title, code: x.examId.code,
         date: x.examId.date, startTime: x.examId.startTime,
         durationMinutes: x.examId.durationMinutes, status: x.examId.status,
+        startsAt: examStartAt(x.examId),
       } : null,
       stats: byRoom[String(x._id)] || { total: 0, present: 0, submitted: 0, flagged: 0 },
     })),
@@ -134,7 +157,7 @@ r.get('/rooms/:roomId/wall', can('invigilation:view'), wrap(async (req, res) => 
   const rank = { flagged: 0, disconnected: 1, scanning: 2, verifying: 3, ok: 4, submitted: 5, terminated: 6, not_started: 7 };
   tiles.sort((a, b) => (rank[a.state] - rank[b.state]) || b.flagScore - a.flagScore);
 
-  const startAt = exam ? new Date(`${exam.date}T${exam.startTime}:00`) : null;
+  const startAt = exam ? examStartAt(exam) : null;
 
   res.json({
     room: { id: String(room._id), name: room.name, capacity: room.capacity },

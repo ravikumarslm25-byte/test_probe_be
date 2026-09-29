@@ -11,7 +11,9 @@ import { connectDb } from './config/db.js';
 import { notFoundHandler, errorHandler } from './middleware/error.js';
 import { storageRoot } from './services/storage.js';
 import { attachRealtime, liveStats } from './realtime/live.js';
-import { Role } from './models/core.js';
+import { Role, Institution } from './models/core.js';
+import { Exam } from './models/exam.js';
+import { zonedToUtc, DEFAULT_TIMEZONE } from './utils/time.js';
 import { SYSTEM_ROLES } from './utils/permissions.js';
 
 import authRoutes from './routes/auth.routes.js';
@@ -113,9 +115,39 @@ async function syncSystemRoles() {
   else console.log('[roles] system roles already current');
 }
 
+/* Papers created before examinations carried a zone have no stored
+   instant, so every comparison would fall back to recomputing one on
+   each read. Written once, at boot. */
+async function backfillExamInstants() {
+  const stale = await Exam.find({ $or: [{ startsAt: null }, { startsAt: { $exists: false } }] })
+    .select('date startTime timezone institutionId').lean();
+  if (!stale.length) return;
+
+  const zones = new Map();
+  for (const inst of await Institution.find().select('settings.timezone').lean()) {
+    zones.set(String(inst._id), inst.settings?.timezone || DEFAULT_TIMEZONE);
+  }
+
+  const writes = stale.map((e) => {
+    const tz = e.timezone || zones.get(String(e.institutionId)) || DEFAULT_TIMEZONE;
+    return {
+      updateOne: {
+        filter: { _id: e._id },
+        update: { $set: { timezone: tz, startsAt: zonedToUtc(e.date, e.startTime, tz) } },
+      },
+    };
+  }).filter((w) => w.updateOne.update.$set.startsAt);
+
+  if (writes.length) {
+    await Exam.bulkWrite(writes, { ordered: false });
+    console.log(`[exams] ${writes.length} examination(s) given a stored start instant`);
+  }
+}
+
 const start = async () => {
   await connectDb();
   await syncSystemRoles();
+  await backfillExamInstants();
   const server = app.listen(env.port, () => {
     console.log(`[api] Test Probe listening on http://localhost:${env.port}/api`);
   });

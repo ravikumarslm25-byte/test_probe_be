@@ -7,6 +7,7 @@ import { env } from '../config/env.js';
 import { audit } from '../middleware/audit.js';
 import { wrap, notFound, badRequest } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
+import { isValidTimeZone, DEFAULT_TIMEZONE } from '../utils/time.js';
 
 const r = Router();
 r.use(authenticate);
@@ -44,6 +45,7 @@ export const PLATFORMS = [
 ];
 
 const settingsSchema = z.object({
+  timezone: z.string().refine(isValidTimeZone, 'Not a recognised time zone').optional(),
   verificationWindowMinutes: z.number().int().min(0).max(120).optional(),
   entryCutoffMinutes: z.number().int().min(0).max(240).optional(),
   roomCapacity: z.number().int().min(1).max(500).optional(),
@@ -58,6 +60,7 @@ const settingsSchema = z.object({
 r.get('/', can('settings:view', 'exam:view'), wrap(async (req, res) => {
   const inst = await Institution.findById(req.actor.institutionId).lean();
   if (!inst) throw notFound('Institution not found');
+  if (inst.settings && !inst.settings.timezone) inst.settings.timezone = DEFAULT_TIMEZONE;
 
   /* The institutional list is only a default. Each paper carries its
      own copy, so the screen shows both — otherwise "I enabled macOS

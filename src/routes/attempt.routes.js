@@ -12,6 +12,7 @@ import {
 } from '../utils/grading.js';
 import { storage, evidenceKey, decodeDataUrl, validateUpload } from '../services/storage.js';
 import { pushToWatchers } from '../realtime/live.js';
+import { examStartAt, formatInZone } from '../utils/time.js';
 
 const r = Router();
 r.use(authenticate, studentOnly);
@@ -100,7 +101,7 @@ r.get('/mine', wrap(async (req, res) => {
 
   const items = attempts.filter((a) => a.examId).map((a) => {
     const exam = a.examId;
-    const startAt = new Date(`${exam.date}T${exam.startTime}:00`);
+    const startAt = examStartAt(exam);
     const opensAt = new Date(startAt.getTime() - windowMin * 60000);
     const closesAt = new Date(startAt.getTime() + cutoffMin * 60000);
     const t = now();
@@ -193,7 +194,7 @@ r.post('/:id/join', wrap(async (req, res) => {
   attempt.joinedAt = attempt.joinedAt || now();
   await attempt.save();
 
-  const startAt = new Date(`${exam.date}T${exam.startTime}:00`);
+  const startAt = examStartAt(exam);
 
   res.json({
     ok: true,
@@ -274,7 +275,7 @@ r.post('/:id/start', wrap(async (req, res) => {
   }
 
   const institution = await Institution.findById(req.actor.institutionId).lean();
-  const startAt = new Date(`${exam.date}T${exam.startTime}:00`);
+  const startAt = examStartAt(exam);
   const cutoff = new Date(startAt.getTime() + (institution?.settings?.entryCutoffMinutes ?? 15) * 60000);
   const t = now();
 

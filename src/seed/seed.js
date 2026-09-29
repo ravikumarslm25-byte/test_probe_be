@@ -7,6 +7,7 @@ import {
 import { Exam, Question, Room, Attempt, Ticket, Audit } from '../models/exam.js';
 import { SYSTEM_ROLES } from '../utils/permissions.js';
 import { samplePaper } from '../data/sample-bank.js';
+import { todayInZone, utcToZoned, zonedToUtc, DEFAULT_TIMEZONE as DEMO_TIMEZONE } from '../utils/time.js';
 
 const AY = '2026-27';
 /* Demo password for every seeded account. Local development uses a
@@ -233,12 +234,22 @@ async function run() {
     ],
   };
 
-  const today = new Date();
-  const iso = (offsetDays) => new Date(today.getTime() + offsetDays * 864e5).toISOString().slice(0, 10);
+  /* Dates and times are written the way the institution writes them,
+     in its own zone — not the server's. The demonstration server runs
+     in Virginia while the institution is in Chennai, and a paper
+     seeded against the server's clock opened five and a half hours
+     late for everyone looking at it.
+
+     The live paper is placed relative to the moment of seeding, so a
+     demonstration works whatever time of day it is set up. A fixed
+     10:00 was only ever live if you seeded before ten. */
+  const TZ = DEMO_TIMEZONE;
+  const iso = (offsetDays) => todayInZone(TZ, offsetDays);
+  const liveStart = utcToZoned(new Date(Date.now() - 25 * 60000), TZ);   // began 25 minutes ago
 
   const examSpecs = [
     { code: '19CSC201', subject: subjects['19CSC201'], batches: [cseA], title: 'Foundations of Computing',
-      date: iso(0), startTime: '10:00', status: 'live' },
+      date: liveStart.date, startTime: liveStart.time, status: 'live' },
     { code: '19ITC304', subject: subjects['19ITC304'], batches: [it2A], title: 'Python Programming',
       date: iso(2), startTime: '14:00', status: 'scheduled' },
     { code: '19CSC305', subject: subjects['19CSC305'], batches: [cseA], title: 'Database Management Systems',
@@ -256,13 +267,13 @@ async function run() {
       subjectId: spec.subject._id,
       batchIds: spec.batches.map((b) => b._id),
       title: spec.title, code: spec.code, type: 'internal',
-      date: spec.date, startTime: spec.startTime,
+      date: spec.date, startTime: spec.startTime, timezone: TZ,
       durationMinutes: 120, totalMarks: 50, passMark: 20,
       blueprint,
       instructions: 'Read all questions before answering. Parts A and B close permanently once you enter Part C. Keep your face within the camera frame throughout. The room must remain silent.',
       status: spec.status,
       publishedAt: spec.status === 'draft' ? undefined : new Date(),
-      sealedUntil: new Date(`${spec.date}T${spec.startTime}:00`),
+      sealedUntil: zonedToUtc(spec.date, spec.startTime, TZ),
       createdBy: staff['ananth@sathyabama.ac.in']._id,
     });
 

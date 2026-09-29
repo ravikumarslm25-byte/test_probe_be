@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { zonedToUtc, DEFAULT_TIMEZONE } from '../utils/time.js';
 
 const { Schema, model, Types } = mongoose;
 const ref = (name, opts = {}) => ({ type: Types.ObjectId, ref: name, index: true, ...opts });
@@ -25,8 +26,19 @@ const examSchema = new Schema({
   code:  { type: String, required: true },
   type:  { type: String, enum: ['internal', 'model', 'end_semester'], default: 'internal' },
 
-  date:            { type: String, required: true },  // YYYY-MM-DD
-  startTime:       { type: String, required: true },  // HH:mm
+  date:            { type: String, required: true },  // YYYY-MM-DD, as the institution writes it
+  startTime:       { type: String, required: true },  // HH:mm, wall clock in `timezone`
+
+  /* The zone those two are read in, copied from the institution when
+     the paper is created. Kept on the paper so a scheduled
+     examination keeps its instant even if the institution's zone is
+     changed later. */
+  timezone:        { type: String, default: DEFAULT_TIMEZONE },
+
+  /* The single true instant the paper begins, derived from the three
+     fields above. Every comparison in the product uses this; nothing
+     re-reads a wall clock against the server's own zone. */
+  startsAt:        { type: Date, index: true },
   durationMinutes: { type: Number, required: true },
   totalMarks:      { type: Number, required: true },
   passMark:        { type: Number, required: true },
@@ -78,11 +90,24 @@ examSchema.methods.blueprintTotal = function () {
   }, 0);
 };
 
+/* Derived, never typed in. Recomputed whenever the written date,
+   time or zone changes, so the stored instant cannot drift from what
+   the examination cell entered. */
+examSchema.pre('validate', function (next) {
+  if (this.isModified('date') || this.isModified('startTime')
+      || this.isModified('timezone') || !this.startsAt) {
+    const at = zonedToUtc(this.date, this.startTime, this.timezone);
+    if (at) this.startsAt = at;
+  }
+  next();
+});
+
 examSchema.virtual('startAt').get(function () {
-  return new Date(`${this.date}T${this.startTime}:00`);
+  return this.startsAt || zonedToUtc(this.date, this.startTime, this.timezone);
 });
 examSchema.virtual('endAt').get(function () {
-  return new Date(this.startAt.getTime() + this.durationMinutes * 60000);
+  const s = this.startAt;
+  return s ? new Date(s.getTime() + this.durationMinutes * 60000) : null;
 });
 
 /* ---------------- Question ---------------- */

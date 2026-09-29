@@ -7,11 +7,14 @@ import { samplePaper } from '../data/sample-bank.js';
 import { audit } from '../middleware/audit.js';
 import { wrap, notFound, badRequest, conflict, forbidden } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
+import { syncExamStatuses, syncExamStatus } from '../utils/examStatus.js';
+import { examStartAt, DEFAULT_TIMEZONE } from '../utils/time.js';
+import { storage } from '../services/storage.js';
 
 const r = Router();
 r.use(authenticate);
 
-const at = (date, time) => new Date(`${date}T${time}:00`);
+
 
 /* ============================ EXAMS ============================ */
 
@@ -43,6 +46,9 @@ r.get('/', can('exam:view'), wrap(async (req, res) => {
     { $group: { _id: '$examId', rooms: { $sum: 1 } } },
   ]);
   const roomsBy = Object.fromEntries(roomCounts.map((s) => [String(s._id), s.rooms]));
+
+  const institution = await Institution.findById(req.actor.institutionId).lean();
+  await syncExamStatuses(Exam, exams, institution);
 
   res.json({
     exams: exams.map((e) => ({
@@ -122,7 +128,15 @@ const examSchema = z.object({
 r.post('/', can('exam:create'), wrap(async (req, res) => {
   const body = parse(examSchema, req.body);
 
-  const exam = new Exam({ ...body, ...tenant(req), createdBy: req.actor.id, status: 'draft' });
+  /* The date and time the cell typed are a wall clock in the
+     institution's own zone. Stamping it on the paper is what turns
+     them into an instant the server can compare against. */
+  const institution = await Institution.findById(req.actor.institutionId).lean();
+  const timezone = institution?.settings?.timezone || DEFAULT_TIMEZONE;
+
+  const exam = new Exam({
+    ...body, ...tenant(req), createdBy: req.actor.id, status: 'draft', timezone,
+  });
   const total = exam.blueprintTotal();
   if (total !== body.totalMarks) {
     throw badRequest(
@@ -139,8 +153,18 @@ r.post('/', can('exam:create'), wrap(async (req, res) => {
 r.patch('/:id', can('exam:edit'), wrap(async (req, res) => {
   const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) });
   if (!exam) throw notFound('Examination not found');
-  if (['live', 'closed', 'evaluation', 'published'].includes(exam.status)) {
-    throw forbidden('This examination has started and can no longer be edited');
+  /* A paper that rolled into its window but that nobody has started
+     is still editable — otherwise a cell that typed the wrong time
+     can neither run the paper nor correct it. Once a candidate has
+     sat it, the paper is part of the record. */
+  if (['closed', 'evaluation', 'published'].includes(exam.status)) {
+    throw forbidden(`This examination is ${exam.status} and can no longer be edited`);
+  }
+  if (exam.status === 'live') {
+    const started = await Attempt.countDocuments({ examId: exam._id, status: { $ne: 'not_started' } });
+    if (started) {
+      throw forbidden(`${started} candidate(s) have already started this paper; it can no longer be edited`);
+    }
   }
 
   const body = parse(examSchema.partial(), req.body);
@@ -348,7 +372,7 @@ r.post('/:id/rooms/auto', can('schedule:create'), wrap(async (req, res) => {
 
   await Room.deleteMany({ examId: exam._id });
 
-  const startAt = at(exam.date, exam.startTime);
+  const startAt = examStartAt(exam);
   const endAt = new Date(startAt.getTime() + exam.durationMinutes * 60000);
   const roomCount = Math.ceil(students.length / capacity);
 
@@ -534,7 +558,7 @@ r.post('/:id/publish', can('exam:publish', 'schedule:publish'), wrap(async (req,
   }
 
   const rooms = await Room.find({ examId: exam._id }).lean();
-  const startAt = at(exam.date, exam.startTime);
+  const startAt = examStartAt(exam);
 
   const attempts = [];
   for (const room of rooms) {
@@ -580,29 +604,61 @@ r.post('/:id/publish', can('exam:publish', 'schedule:publish'), wrap(async (req,
 r.delete('/:id', can('exam:delete'), wrap(async (req, res) => {
   const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) });
   if (!exam) throw notFound('Examination not found');
-  if (!['draft', 'scheduled'].includes(exam.status)) {
-    throw badRequest(`A ${exam.status} examination cannot be deleted; attempts exist against it.`);
+
+  const institution = await Institution.findById(req.actor.institutionId).lean();
+  await syncExamStatus(exam, institution);
+
+  /* A paper being sat right now is the one thing that cannot be
+     deleted: candidates are mid-answer and their attempts are open.
+     Everything else may go, because a demonstration institution has
+     to be clearable and a cell that scheduled the wrong paper should
+     not be stuck with it for ever. */
+  if (exam.status === 'live') {
+    const sitting = await Attempt.countDocuments({ examId: exam._id, status: 'in_progress' });
+    if (sitting) {
+      throw badRequest(`${sitting} candidate(s) are sitting this paper right now. Close it first.`);
+    }
   }
-  const started = await Attempt.countDocuments({ examId: exam._id, status: { $ne: 'not_started' } });
-  if (started) throw badRequest(`${started} candidate(s) have already started this paper.`);
+
+  const [attempts, started] = await Promise.all([
+    Attempt.countDocuments({ examId: exam._id }),
+    Attempt.countDocuments({ examId: exam._id, status: { $ne: 'not_started' } }),
+  ]);
+
+  /* Records exist, so say exactly what will be destroyed and make
+     the caller ask again. The web app turns this into a second
+     confirmation naming the same numbers. */
+  if (started > 0 && req.query.force !== 'true') {
+    throw conflict(
+      `This examination holds ${started} sat attempt(s), with their marks and proctoring evidence. `
+      + 'Deleting it destroys all of that permanently.',
+      { requiresForce: true, attempts, started, title: exam.title, code: exam.code },
+    );
+  }
 
   await Promise.all([
     Question.deleteMany({ examId: exam._id }),
     Room.deleteMany({ examId: exam._id }),
     Attempt.deleteMany({ examId: exam._id }),
   ]);
-  if (exam.status === 'scheduled') {
-    // release the licences the schedule reserved
-    const n = await Attempt.countDocuments({ examId: exam._id });
-    await Institution.findByIdAndUpdate(req.actor.institutionId, { $inc: { 'licence.reserved': -n } });
-  }
-  await exam.deleteOne();
-  await audit(req, { action: 'exam.deleted', entity: 'Exam', entityId: exam._id, before: { title: exam.title, status: exam.status } });
-  res.json({ ok: true });
-}));
 
-/* ============================================================
-   ANSWER SHEET UPLOAD — typed and uploaded may coexist
-   ============================================================ */
+  /* Captures outlive the database rows unless they are removed too. */
+  try {
+    await storage.remove(`${req.actor.institutionId}/${exam._id}`);
+  } catch (e) {
+    console.warn('[exam.delete] evidence not removed:', e.message);
+  }
+
+  if (['scheduled', 'live'].includes(exam.status) && attempts) {
+    await Institution.findByIdAndUpdate(req.actor.institutionId, {
+      $inc: { 'licence.reserved': -attempts },
+    });
+  }
+
+  await exam.deleteOne();
+  await audit(req, { action: 'exam.deleted', entity: 'Exam', entityId: exam._id,
+    before: { title: exam.title, code: exam.code, status: exam.status, attempts, started } });
+  res.json({ ok: true, deleted: { attempts, started } });
+}));
 
 export default r;

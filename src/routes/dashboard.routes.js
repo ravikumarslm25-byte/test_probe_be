@@ -4,6 +4,7 @@ import { Institution } from '../models/core.js';
 import { authenticate, can, tenant, resolveScope } from '../middleware/auth.js';
 import { wrap } from '../utils/http.js';
 import { VIOLATION_CATALOGUE } from '../utils/grading.js';
+import { examStartAt } from '../utils/time.js';
 
 const r = Router();
 r.use(authenticate);
@@ -57,7 +58,7 @@ r.get('/', can('exam:view'), wrap(async (req, res) => {
       Room.countDocuments({ examId: live._id }),
     ]);
     const st = stats[0] || {};
-    const startAt = new Date(`${live.date}T${live.startTime}:00`);
+    const startAt = examStartAt(live);
     liveDetail = {
       id: String(live._id),
       title: live.title, code: live.code,

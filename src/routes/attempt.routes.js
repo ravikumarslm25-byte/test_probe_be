@@ -229,13 +229,23 @@ r.post('/:id/join', wrap(async (req, res) => {
    ============================================================ */
 r.post('/:id/identity', wrap(async (req, res) => {
   const { attempt } = await loadAttempt(req);
-  const body = parse(z.object({
-    face: z.string().min(32),
-    idCard: z.string().min(32),
-  }), req.body);
 
-  const saved = {};
+  /* The two photographs may arrive together or one at a time. Sending
+     them separately halves the size of each request, which matters
+     because anything between the candidate and this service can
+     refuse a body without ever reaching us — and when it does, the
+     browser reports it as a permissions problem and says nothing
+     useful. One photograph per request keeps each one small. */
+  const body = parse(z.object({
+    face: z.string().min(32).optional(),
+    idCard: z.string().min(32).optional(),
+  }).refine((b) => b.face || b.idCard, 'Send at least one photograph'), req.body);
+
+  const identity = { ...(attempt.identity ? attempt.identity.toObject?.() ?? attempt.identity : {}) };
+
   for (const [field, kind] of [['face', 'face'], ['idCard', 'id_card']]) {
+    if (!body[field]) continue;
+
     const decoded = decodeDataUrl(body[field]);
     if (!decoded) throw badRequest(`${field} must be a base64 image`);
 
@@ -248,17 +258,22 @@ r.post('/:id/identity', wrap(async (req, res) => {
       kind, ext: decoded.mime.split('/')[1],
     });
     await storage.put(key, decoded.buffer, decoded.mime);
-    saved[field] = key;
+    identity[field === 'face' ? 'faceKey' : 'idCardKey'] = key;
   }
 
-  attempt.identity = {
-    faceKey: saved.face,
-    idCardKey: saved.idCard,
-    verifiedAt: now(),
-  };
+  /* Verified only once both are held, however they arrived. */
+  const complete = Boolean(identity.faceKey && identity.idCardKey);
+  identity.verifiedAt = complete ? (identity.verifiedAt || now()) : undefined;
+
+  attempt.identity = identity;
   await attempt.save();
 
-  res.json({ ok: true, verifiedAt: attempt.identity.verifiedAt });
+  res.json({
+    ok: true,
+    have: { face: Boolean(identity.faceKey), idCard: Boolean(identity.idCardKey) },
+    complete,
+    verifiedAt: identity.verifiedAt,
+  });
 }));
 
 /* ============================================================

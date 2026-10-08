@@ -21,7 +21,11 @@ const KIND_RULES = {
   id_card:  { max: 4_000_000,  types: ['image/jpeg', 'image/png', 'image/webp'] },
   frame:    { max: 1_500_000,  types: ['image/jpeg', 'image/webp'] },
   screen:   { max: 3_000_000,  types: ['image/jpeg', 'image/webp'] },
-  scan:     { max: 8_000_000,  types: ['image/jpeg', 'image/png', 'image/webp'] },
+  /* A candidate photographs or scans their working on their own
+     phone, and a phone scanner app produces a PDF of several pages
+     rather than separate images. Twenty megabytes covers a six-page
+     scan at the quality an evaluator needs to read handwriting. */
+  scan:     { max: 20_000_000, types: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'] },
   audio:    { max: 2_000_000,  types: ['audio/webm', 'audio/ogg', 'audio/mpeg'] },
 };
 

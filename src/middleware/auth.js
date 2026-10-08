@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
+import { Types } from 'mongoose';
 import { env, isProd } from '../config/env.js';
 import { User, Student, Role, Mapping } from '../models/core.js';
 import { unauthorized, forbidden } from '../utils/http.js';
@@ -122,6 +123,23 @@ export const studentOnly = (req, _res, next) => {
    Never trust an institutionId from the client. Every query
    is scoped to the actor's own institution.                 */
 export const tenant = (req) => ({ institutionId: req.actor.institutionId });
+
+/* The same filter, for an AGGREGATION PIPELINE.
+
+   `req.actor.institutionId` is a string, because it comes off a JWT
+   claim and is compared as a string in a dozen places. A query built
+   with `find()` casts it to an ObjectId against the schema, so
+   `tenant(req)` works there and nowhere is the difference visible.
+
+   An aggregation gets no casting: the pipeline goes to the driver as
+   written, a string never equals a stored ObjectId, and the stage
+   matches NOTHING. It does not error — it returns an empty result,
+   which reads as "there is no data" rather than "this is broken".
+   The question bank showed every subject at zero approved while the
+   list underneath showed fifty-nine. */
+export const tenantAgg = (req) => ({
+  institutionId: new Types.ObjectId(req.actor.institutionId),
+});
 
 /* ---------------- data scoping ----------------
    Resolves which batches and subjects the actor may see.

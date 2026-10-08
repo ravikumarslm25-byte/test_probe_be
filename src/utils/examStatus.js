@@ -16,11 +16,23 @@
    deleting and publishing.
    ============================================================ */
 import { examStartAt } from './time.js';
+import { sweepExpired } from '../services/closeExam.js';
 
 /* Statuses reached by someone doing something — closing a paper,
    submitting marks, publishing results. The clock never overrides
    these. */
 const WORKFLOW_DRIVEN = ['draft', 'closed', 'evaluation', 'published'];
+
+/* A document carries what the status is derived from only if it was
+   loaded with those fields. `undefined` from a narrow projection and
+   `undefined` from an empty column are indistinguishable, so the
+   check is on the presence of the KEY, which a projection omits and
+   a Mongoose document always has. */
+export function hasStatusFields(exam) {
+  if (!exam) return false;
+  if (typeof exam.toObject === 'function') return true;      // a full document
+  return ['writingUntil', 'lastSittingEndsAt', 'closedAt'].every((k) => k in exam);
+}
 
 export function dueStatus(exam, { roomCloseBufferMinutes = 45, at = new Date() } = {}) {
   if (!exam || WORKFLOW_DRIVEN.includes(exam.status)) return exam?.status ?? null;
@@ -28,11 +40,45 @@ export function dueStatus(exam, { roomCloseBufferMinutes = 45, at = new Date() }
   const start = examStartAt(exam);
   if (!start) return exam.status;
 
-  const end = new Date(start.getTime() + (exam.durationMinutes || 0) * 60000);
-  const closed = new Date(end.getTime() + roomCloseBufferMinutes * 60000);
+  /* Ended by hand — unless somebody is still entitled to write.
+
+     Setting it over at once took the extension holders off the
+     invigilator's wall and made their room read-only, while the
+     dialog that ended the paper had just said "keep watching them".
+     The paper is over when the last of them is done. */
+  if (exam.closedAt) {
+    const stillWriting = exam.writingUntil && at < new Date(exam.writingUntil);
+    if (!stillWriting) return 'evaluation';
+    return 'live';
+  }
+
+  let end = new Date(start.getTime() + (exam.durationMinutes || 0) * 60000);
+
+  /* The last moment anyone may still legitimately be writing.
+
+     This used to be the paper's nominal end plus a flat
+     forty-five-minute room-close buffer, which meant an examination
+     that finished at 10:30 still read "In progress" at 11:14 with an
+     empty hall. The buffer was there to cover late joiners and
+     extensions — so cover those exactly, rather than guessing a
+     window that is both too long for an ordinary paper and too short
+     for a long extension.
+
+     `writingUntil` carries the latest extension and the latest
+     alternate sitting; it is maintained when either is granted. */
+  for (const later of [exam.lastSittingEndsAt, exam.writingUntil]) {
+    if (later && new Date(later) > end) end = new Date(later);
+  }
+
+  /* A short grace on the end itself, because a candidate who started
+     a minute late finishes a minute late, and flipping the paper to
+     evaluation while the last of them is pressing Submit helps
+     nobody. Far shorter than the old room-close buffer, and it no
+     longer has to stand in for extensions. */
+  const grace = new Date(end.getTime() + Math.min(roomCloseBufferMinutes, 5) * 60000);
 
   if (at < start) return 'scheduled';
-  if (at <= closed) return 'live';
+  if (at <= grace) return 'live';
   return 'evaluation';        // sitting is over; marks are what remain
 }
 
@@ -43,12 +89,26 @@ export async function syncExamStatuses(Exam, exams, institution) {
   const buffer = institution?.settings?.roomCloseBufferMinutes ?? 45;
   const at = new Date();
   const writes = [];
+  const justMoved = new Set();
 
   for (const exam of exams) {
+    /* A paper loaded through a narrow projection does not carry the
+       fields the status is derived from, and deriving it anyway
+       produced a WRONG status that was then written back — past the
+       point of correction, because 'evaluation' is workflow-driven.
+       Refuse rather than guess. */
+    if (!hasStatusFields(exam)) {
+      console.warn(`[exam-status] ${exam.code || exam._id} was loaded without the fields the`
+        + ' status is derived from (writingUntil, lastSittingEndsAt, closedAt). Left alone.'
+        + ' Widen the projection at the call site.');
+      continue;
+    }
+
     const due = dueStatus(exam, { roomCloseBufferMinutes: buffer, at });
     if (due && due !== exam.status) {
       writes.push({ updateOne: { filter: { _id: exam._id }, update: { $set: { status: due } } } });
       exam.status = due;
+      justMoved.add(String(exam._id));
     }
   }
 
@@ -60,6 +120,41 @@ export async function syncExamStatuses(Exam, exams, institution) {
       console.warn('[exam-status] could not persist', writes.length, 'change(s):', e.message);
     }
   }
+
+  /* A paper that has just moved past its window is also swept: every
+     attempt whose own clock has run out is sealed.
+
+     Without this a candidate who shut their laptop stayed "in
+     progress" for ever, because an attempt is only auto-submitted
+     when that candidate's OWN browser next calls the API. Their
+     script never reached the evaluator and the results could not be
+     published. Done here, on the read that notices the paper is
+     over, so nothing has to be left running. */
+  for (const exam of exams) {
+    /* Only the papers THIS call moved. Sweeping every paper already
+       in evaluation cost an Attempt query per finished paper on every
+       list load, for a term's worth of them. */
+    if (!justMoved.has(String(exam._id))) continue;
+    /* Sealing decides pass or fail, so a paper loaded without its
+       pass mark is not swept here — it would seal the attempt with
+       an undecidable result, and that result is what gets published.
+       `gradeObjective` refuses too; this says it once per paper
+       rather than once per candidate. */
+    if (exam.passMark === null || exam.passMark === undefined) {
+      console.warn(`[exam-status] ${exam.code || exam._id} was loaded without passMark;`
+        + ' not sealing expired attempts. Widen the projection at the call site.');
+      continue;
+    }
+    try {
+      const sealed = await sweepExpired(exam, at);
+      if (sealed) {
+        console.log(`[exam-status] ${exam.code}: sealed ${sealed} attempt(s) whose time had run out`);
+      }
+    } catch (e) {
+      console.warn('[exam-status] sweep failed for', exam.code, e.message);
+    }
+  }
+
   return exams;
 }
 

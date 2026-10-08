@@ -1,23 +1,32 @@
 import { Router } from 'express';
+import crypto from 'node:crypto';
 import { z } from 'zod';
-import { Exam, Question, Room, Attempt } from '../models/exam.js';
-import { Institution, Student, User } from '../models/core.js';
+import QRCode from 'qrcode';
+import { Exam, Question, Room, Attempt, UploadPass } from '../models/exam.js';
+import { Institution } from '../models/core.js';
 import { authenticate, studentOnly, tenant } from '../middleware/auth.js';
-import { audit } from '../middleware/audit.js';
 import { wrap, notFound, badRequest, forbidden, conflict } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
 import {
-  gradeMcq, gradeFib, suggestDescriptive, applyBestN, hasContent,
-  SEVERITY_WEIGHT, VIOLATION_CATALOGUE,
+  hasContent, SEVERITY_WEIGHT, VIOLATION_CATALOGUE,
 } from '../utils/grading.js';
 import { storage, evidenceKey, decodeDataUrl, validateUpload } from '../services/storage.js';
 import { pushToWatchers } from '../realtime/live.js';
-import { examStartAt, formatInZone } from '../utils/time.js';
+import { formatInZone } from '../utils/time.js';
+import { sittingFor } from '../utils/sitting.js';
+import { env } from '../config/env.js';
+import { sanitiseAnswerHtml } from '../utils/sanitise.js';
+import { finaliseAttempt, gradeObjective } from '../services/finalise.js';
 
 const r = Router();
 r.use(authenticate, studentOnly);
 
 const now = () => new Date();
+
+/* Long enough to photograph several pages and upload them over a
+   phone connection; short enough that a code photographed off
+   someone else's screen is worthless by the time it is used. */
+const PASS_MINUTES = 15;
 
 /* ============================================================
    Loads the attempt and refuses anything that is not the signed-in
@@ -42,7 +51,7 @@ async function loadAttempt(req, { requireActive = false } = {}) {
     // The timer is authoritative on the server. A client with a
     // frozen clock cannot buy itself extra time.
     if (attempt.timerEndsAt && now() > attempt.timerEndsAt) {
-      await finalise(attempt, exam, { auto: true });
+      await finaliseAttempt(attempt, exam, { auto: true });
       throw forbidden('Your time has ended and the paper was submitted automatically');
     }
   }
@@ -101,7 +110,12 @@ r.get('/mine', wrap(async (req, res) => {
 
   const items = attempts.filter((a) => a.examId).map((a) => {
     const exam = a.examId;
-    const startAt = examStartAt(exam);
+    /* This candidate's own window, which for almost everyone is the
+       examination's — and for a candidate given a sitting of their
+       own is not. Reading the examination's start here would show
+       them "missed" hours before their arranged time. */
+    const sitting = sittingFor(a, exam);
+    const startAt = sitting.startAt;
     const opensAt = new Date(startAt.getTime() - windowMin * 60000);
     const closesAt = new Date(startAt.getTime() + cutoffMin * 60000);
     const t = now();
@@ -115,6 +129,10 @@ r.get('/mine', wrap(async (req, res) => {
     return {
       attemptId: String(a._id),
       status: a.status,
+      sitting: sitting.isAlternate
+        ? { startAt: sitting.startAt, endsAt: sitting.endsAt,
+            durationMinutes: sitting.durationMinutes, reason: sitting.reason }
+        : null,
       phase,
       exam: {
         id: String(exam._id),
@@ -194,7 +212,8 @@ r.post('/:id/join', wrap(async (req, res) => {
   attempt.joinedAt = attempt.joinedAt || now();
   await attempt.save();
 
-  const startAt = examStartAt(exam);
+  const sitting = sittingFor(attempt, exam);
+  const startAt = sitting.startAt;
 
   res.json({
     ok: true,
@@ -202,15 +221,24 @@ r.post('/:id/join', wrap(async (req, res) => {
       id: String(attempt._id),
       status: attempt.status,
       identityVerified: Boolean(attempt.identity?.verifiedAt),
+      sitting: sitting.isAlternate
+        ? { startAt: sitting.startAt, endsAt: sitting.endsAt,
+            durationMinutes: sitting.durationMinutes, reason: sitting.reason }
+        : null,
     },
     exam: {
       title: exam.title, code: exam.code,
-      durationMinutes: exam.durationMinutes,
+      durationMinutes: sitting.durationMinutes,
       totalMarks: exam.totalMarks,
       instructions: exam.instructions,
       startAt,
       blueprint: exam.blueprint,
       proctoring: {
+        /* The candidate's screen has to know whether this paper wants
+           an identity capture, not merely whether one has happened.
+           Left out, every paper demanded it however the examination
+           cell had set the paper up. */
+        idVerification: exam.proctoring.idVerification !== false,
         faceTracking: exam.proctoring.faceTracking,
         audioMonitoring: exam.proctoring.audioMonitoring,
         browserLock: exam.proctoring.browserLock,
@@ -290,12 +318,16 @@ r.post('/:id/start', wrap(async (req, res) => {
   }
 
   const institution = await Institution.findById(req.actor.institutionId).lean();
-  const startAt = examStartAt(exam);
+  const sitting = sittingFor(attempt, exam);
+  const startAt = sitting.startAt;
   const cutoff = new Date(startAt.getTime() + (institution?.settings?.entryCutoffMinutes ?? 15) * 60000);
   const t = now();
 
   if (t < startAt) {
-    throw badRequest(`This examination begins at ${exam.startTime}. The paper is sealed until then.`);
+    const zone = exam.timezone || institution?.settings?.timezone;
+    throw badRequest(sitting.isAlternate
+      ? `Your sitting begins at ${formatInZone(startAt, zone)}. The paper is sealed until then.`
+      : `This examination begins at ${exam.startTime}. The paper is sealed until then.`);
   }
 
   if (attempt.status !== 'in_progress') {
@@ -305,12 +337,21 @@ r.post('/:id/start', wrap(async (req, res) => {
 
     /* Duration runs from actual join, but is hard-stopped at room
        close so a late candidate cannot keep a room open indefinitely. */
-    const room = await Room.findById(attempt.roomId).lean();
     const buffer = institution?.settings?.roomCloseBufferMinutes ?? 45;
-    const roomClose = room
-      ? new Date(new Date(room.endAt).getTime() + buffer * 60000)
-      : new Date(startAt.getTime() + (exam.durationMinutes + buffer) * 60000);
-    const personal = new Date(t.getTime() + exam.durationMinutes * 60000);
+
+    /* The room's own window does not bound a candidate sitting in a
+       window of their own — the hall emptied hours ago. Their hard
+       stop is the end of THEIR sitting. */
+    let roomClose;
+    if (sitting.isAlternate) {
+      roomClose = new Date(sitting.endsAt.getTime() + buffer * 60000);
+    } else {
+      const room = await Room.findById(attempt.roomId).lean();
+      roomClose = room
+        ? new Date(new Date(room.endAt).getTime() + buffer * 60000)
+        : new Date(startAt.getTime() + (exam.durationMinutes + buffer) * 60000);
+    }
+    const personal = new Date(t.getTime() + sitting.durationMinutes * 60000);
 
     attempt.status = 'in_progress';
     attempt.startedAt = t;
@@ -353,7 +394,10 @@ r.post('/:id/start', wrap(async (req, res) => {
       lockedSections: attempt.sectionState.lockedSections,
       answers: attempt.answers.map((a) => ({
         questionId: String(a.questionId),
-        selected: a.selected, text: a.text, html: a.html,
+        /* Cleaned on the way back out as well, because this is set
+           straight into the editor's innerHTML and rows written
+           before the sanitiser existed are still stored. */
+        selected: a.selected, text: a.text, html: sanitiseAnswerHtml(a.html),
         mode: a.mode,
         scanPages: (a.scanPages || []).length,
         markedForReview: a.markedForReview,
@@ -362,7 +406,10 @@ r.post('/:id/start', wrap(async (req, res) => {
     exam: {
       title: exam.title, code: exam.code,
       totalMarks: exam.totalMarks,
-      durationMinutes: exam.durationMinutes,
+      /* The sitting's duration, which is what the clock actually runs
+         on. Reporting the paper's would tell a candidate on a
+         shortened sitting they had longer than they do. */
+      durationMinutes: sitting.durationMinutes,
       proctoring: exam.proctoring,
     },
     sections,
@@ -408,7 +455,12 @@ r.patch('/:id/answers/:questionId', wrap(async (req, res) => {
     answer.selected = body.selected;
   }
   if (body.text !== undefined) answer.text = body.text;
-  if (body.html !== undefined) answer.html = body.html;
+  /* Reduced to the markup the editor can produce, on the way in. The
+     evaluator's viewer renders this as HTML, so an answer is a way to
+     run script in a member of staff's session unless it is cleaned —
+     and the editor can be bypassed with one request from the
+     candidate's own console. */
+  if (body.html !== undefined) answer.html = sanitiseAnswerHtml(body.html);
   if (body.mode !== undefined) answer.mode = body.mode;
   if (body.markedForReview !== undefined) answer.markedForReview = body.markedForReview;
   answer.answeredAt = now();
@@ -685,7 +737,10 @@ r.post('/:id/scan-pages/:questionId', wrap(async (req, res) => {
       kind: 'scan', ext: decoded.mime.split('/')[1],
     });
     await storage.put(key, decoded.buffer, decoded.mime);
-    stored.push({ key, page: i + 1, uploadedAt: now() });
+    /* `page` is assigned below, continuing from what the answer
+       already holds — not from this batch's own index, which would
+       collide with pages already attached. */
+    stored.push({ key, mime: decoded.mime, bytes: decoded.buffer.length, uploadedAt: now() });
   }
 
   let answer = attempt.answers.find((a) => String(a.questionId) === String(question._id));
@@ -696,7 +751,17 @@ r.post('/:id/scan-pages/:questionId', wrap(async (req, res) => {
   /* A candidate may type part of an answer and upload a worked page
      for the rest. Both are kept; the evaluator sees both. */
   answer.mode = answer.html || answer.text ? 'mixed' : 'scanned';
-  answer.scanPages = [...(answer.scanPages || []), ...stored].slice(-12);
+  /* Refused at the cap rather than trimmed. `.slice(-12)` dropped the
+     earliest page once a candidate sent a thirteenth, so the file
+     stayed in storage while the answer stopped pointing at it and
+     nobody was told. Page numbers continue from the highest already
+     there, so two pages cannot share one number. */
+  const held = answer.scanPages || [];
+  if (held.length + stored.length > 12) {
+    throw badRequest(`This answer holds ${held.length} page(s); 12 is the most one answer can carry.`);
+  }
+  let next = held.reduce((max, p) => Math.max(max, p.page || 0), 0);
+  answer.scanPages = [...held, ...stored.map((s) => ({ ...s, page: ++next }))];
   answer.answeredAt = now();
 
   const win = attempt.scanWindows.find((w) => !w.closedAt);
@@ -704,6 +769,110 @@ r.post('/:id/scan-pages/:questionId', wrap(async (req, res) => {
 
   await attempt.save();
   res.json({ ok: true, pages: stored.length });
+}));
+
+/* ============================================================
+   UPLOADING AN ANSWER FROM THE CANDIDATE'S OWN PHONE
+
+   Writing a long answer with a mouse is not writing. The candidate
+   works on paper, then uploads it — and the upload must not happen on
+   the examination machine, because leaving the examination tab to
+   find a file is exactly the behaviour the proctoring is there to
+   stop.
+
+   So the examination page shows a QR code. The phone opens the
+   address inside it, uploads there, and the examination page is told
+   over its own live socket. The candidate never leaves the paper.
+   ============================================================ */
+r.post('/:id/upload-pass', wrap(async (req, res) => {
+  const { attempt, exam } = await loadAttempt(req, { requireActive: true });
+  const { questionId } = parse(z.object({ questionId: z.string() }), req.body);
+
+  const question = await Question.findOne({ _id: questionId, examId: exam._id }).lean();
+  if (!question) throw notFound('Question not found');
+  if (question.type !== 'desc') throw badRequest('Only descriptive answers accept an upload');
+
+  if (!exam.proctoring?.mobileScan) {
+    throw forbidden('This paper must be answered on screen; uploading is not enabled for it');
+  }
+
+  /* A pass already open for this question is handed back rather than
+     reissued, so a candidate who closes the dialog and reopens it
+     scans the same code and does not strand a half-finished upload. */
+  const existing = await UploadPass.findOne({
+    attemptId: attempt._id, questionId: question._id,
+    closedAt: null, expiresAt: { $gt: now() },
+  }).lean();
+
+  const pass = existing || await UploadPass.create({
+    ...tenant(req),
+    token: crypto.randomBytes(24).toString('base64url'),
+    attemptId: attempt._id,
+    examId: exam._id,
+    studentId: req.actor.id,
+    questionId: question._id,
+    section: question.section,
+    questionNumber: (question.order ?? 0) + 1,
+    expiresAt: new Date(now().getTime() + PASS_MINUTES * 60000),
+  });
+
+  /* The same window the mobile-scan pathway records, so an
+     invigilator's view still shows that this candidate was uploading
+     rather than writing. */
+  if (!existing && !attempt.scanWindows.find((w) => !w.closedAt)) {
+    attempt.scanWindows.push({ questionId: question._id, openedAt: now(), pages: 0 });
+    await attempt.save();
+  }
+
+  const url = `${env.appUrl}/u/${pass.token}`;
+  res.status(existing ? 200 : 201).json({
+    token: pass.token,
+    url,
+    /* Drawn on the server so the examination page carries no QR
+       library and no second request. */
+    qrSvg: await QRCode.toString(url, { type: 'svg', margin: 1, width: 240,
+                                        errorCorrectionLevel: 'M' }),
+    expiresAt: pass.expiresAt,
+    files: (pass.files || []).length,
+    maxFiles: pass.maxFiles,
+    questionNumber: pass.questionNumber,
+  });
+}));
+
+/* The examination page asks this while the dialog is open, as a
+   fallback for a live socket that has dropped. The socket push is the
+   normal path; this is what makes the feature work anyway when it
+   does not arrive. */
+r.get('/:id/upload-pass/:token', wrap(async (req, res) => {
+  const { attempt } = await loadAttempt(req);
+  const pass = await UploadPass.findOne({
+    token: req.params.token, attemptId: attempt._id, ...tenant(req),
+  }).lean();
+  if (!pass) throw notFound('That upload has expired');
+
+  res.json({
+    files: (pass.files || []).map((f) => ({
+      name: f.name, mime: f.mime, bytes: f.bytes, uploadedAt: f.uploadedAt,
+    })),
+    closed: Boolean(pass.closedAt),
+    expiresAt: pass.expiresAt,
+  });
+}));
+
+/* Done with the phone: the pass is spent and the scan window closes. */
+r.post('/:id/upload-pass/:token/close', wrap(async (req, res) => {
+  const { attempt } = await loadAttempt(req, { requireActive: true });
+  const pass = await UploadPass.findOne({
+    token: req.params.token, attemptId: attempt._id, ...tenant(req),
+  });
+  if (!pass) throw notFound('That upload has expired');
+
+  if (!pass.closedAt) { pass.closedAt = now(); await pass.save(); }
+  const win = attempt.scanWindows.find((w) => !w.closedAt
+    && String(w.questionId) === String(pass.questionId));
+  if (win) { win.closedAt = now(); await attempt.save(); }
+
+  res.json({ ok: true, files: (pass.files || []).length });
 }));
 
 /* ============================================================
@@ -716,77 +885,9 @@ r.post('/:id/submit', wrap(async (req, res) => {
   }
   if (attempt.status !== 'in_progress') throw forbidden('This examination is not in progress');
 
-  const summary = await finalise(attempt, exam, { auto: false });
+  const summary = await finaliseAttempt(attempt, exam, { auto: false });
   res.json({ ok: true, ...summary });
 }));
-
-/* Grades the objective parts, applies best-N to the choice section
-   and seals the attempt. Descriptive answers stay pending. */
-async function gradeObjective(attempt, exam) {
-  const questions = await Question.find({ examId: exam._id }).lean();
-  const byId = new Map(questions.map((q) => [String(q._id), q]));
-
-  let a = 0, b = 0;
-  let descNeedsEval = false;
-
-  for (const ans of attempt.answers) {
-    const q = byId.get(String(ans.questionId));
-    if (!q) continue;
-
-    if (q.type === 'mcq') {
-      const g = gradeMcq(q, ans);
-      ans.autoAwarded = g.awarded; ans.awarded = g.awarded;
-      a += g.awarded;
-    } else if (q.type === 'fib') {
-      const g = gradeFib(q, ans);
-      ans.autoAwarded = g.awarded;
-      ans.awarded = g.awarded;
-      ans.needsReview = g.needsReview && hasContent(ans);
-      b += g.awarded;
-    } else if (q.type === 'desc') {
-      const s = suggestDescriptive(q, ans);
-      ans.suggested = s.suggested;
-      ans.keywordHits = s.hits;
-      if (hasContent(ans)) descNeedsEval = true;
-    }
-  }
-
-  // best-N across the descriptive section
-  const descSection = exam.blueprint.sections.find((s) => s.type === 'desc');
-  if (descSection) {
-    const descAnswers = attempt.answers.filter((x) => {
-      const q = byId.get(String(x.questionId));
-      return q?.type === 'desc';
-    });
-    applyBestN(descAnswers, descSection.answerCount || descAnswers.length);
-  }
-
-  attempt.marks.sectionA = Math.round(a * 100) / 100;
-  attempt.marks.sectionB = Math.round(b * 100) / 100;
-  attempt.marks.sectionC = 0;
-  attempt.marks.total = attempt.marks.sectionA + attempt.marks.sectionB;
-  attempt.marks.passed = false;   // undecidable until Part C is evaluated
-
-  attempt.evaluation.state = descNeedsEval ? 'pending' : 'submitted';
-  return { a, b, descNeedsEval };
-}
-
-async function finalise(attempt, exam, { auto }) {
-  const counts = await gradeObjective(attempt, exam);
-  attempt.status = 'submitted';
-  attempt.submittedAt = now();
-  attempt.autoSubmitted = auto;
-  await attempt.save();
-
-  const answered = attempt.answers.filter(hasContent).length;
-  return {
-    submittedAt: attempt.submittedAt,
-    autoSubmitted: auto,
-    answered,
-    flagScore: attempt.flagScore,
-    awaitingEvaluation: counts.descNeedsEval,
-  };
-}
 
 /* ============================================================
    RESULT

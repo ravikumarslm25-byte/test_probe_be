@@ -178,7 +178,11 @@ r.post('/staff/:id/reset-password', can('staff:edit'), wrap(async (req, res) => 
 /* Bulk upload — rows validated before anything is written, and a
    row-level error report returned so a partial file can be fixed. */
 r.post('/staff/bulk', can('staff:create'), wrap(async (req, res) => {
-  const rows = z.array(staffSchema).max(1000).parse(req.body?.rows || []);
+  /* The shared `parse` helper, not zod's own: a bare `.parse` throws a
+     ZodError, which no branch of the error handler recognises, so one
+     malformed row in a sixty-row roll came back as a 500 saying
+     "something went wrong on our side" — no row number, no reason. */
+  const rows = parse(z.array(staffSchema).max(1000), req.body?.rows || []);
   const errors = [];
   const ready = [];
 
@@ -215,16 +219,26 @@ r.get('/students', can('student:view'), wrap(async (req, res) => {
   if (q) filter.$or = [{ name: new RegExp(q, 'i') }, { regNo: new RegExp(q, 'i') }];
 
   const students = await Student.find(filter)
-    .populate('batchId', 'label')
-    .populate('departmentId', 'name')
-    .sort({ regNo: 1 }).limit(1000).lean();
+    /* Year and section travel with the class, not just its label. The
+       students screen filters on them, and deriving them by picking
+       apart "III Year B.E. — Section A" would break the moment an
+       institution writes its labels differently. */
+    .populate('batchId', 'label year section programme academicYear')
+    .populate('departmentId', 'name code')
+    .sort({ regNo: 1 }).limit(2000).lean();
 
   res.json({
     students: students.map((s) => ({
       id: String(s._id),
       regNo: s.regNo, name: s.name, email: s.email, mobile: s.mobile,
-      batch: s.batchId ? { id: String(s.batchId._id), label: s.batchId.label } : null,
-      department: s.departmentId ? { id: String(s.departmentId._id), name: s.departmentId.name } : null,
+      batch: s.batchId ? {
+        id: String(s.batchId._id), label: s.batchId.label,
+        year: s.batchId.year, section: s.batchId.section,
+        programme: s.batchId.programme, academicYear: s.batchId.academicYear,
+      } : null,
+      department: s.departmentId
+        ? { id: String(s.departmentId._id), name: s.departmentId.name, code: s.departmentId.code }
+        : null,
       hasPhoto: Boolean(s.photoKey),
       hasIdProof: Boolean(s.idProofKey),
       status: s.status,
@@ -269,19 +283,34 @@ r.post('/students', can('student:create'), wrap(async (req, res) => {
 }));
 
 r.post('/students/bulk', can('student:create'), wrap(async (req, res) => {
-  const rows = z.array(studentSchema).max(2000).parse(req.body?.rows || []);
+  const rows = parse(z.array(studentSchema).max(2000), req.body?.rows || []);
   const errors = [];
+  const credentials = [];
   let created = 0;
+
+  /* A duplicate register number inside the FILE never reaches the
+     unique index, because the first of the pair is written before the
+     second is checked. Caught here so the roll is not silently short
+     of one student. */
+  const seenInFile = new Set();
 
   for (const [i, row] of rows.entries()) {
     try {
+      if (seenInFile.has(row.regNo)) {
+        errors.push({ row: i + 1, regNo: row.regNo, error: 'This register number appears twice in the file' });
+        continue;
+      }
+      seenInFile.add(row.regNo);
+
       await assertBatchInScope(req.actor, row.batchId);
       const exists = await Student.findOne({ regNo: row.regNo, ...tenant(req) }).lean();
       if (exists) { errors.push({ row: i + 1, regNo: row.regNo, error: 'Register number already exists' }); continue; }
+      const temp = tempPassword();
       await Student.create({
         ...row, ...tenant(req),
-        passwordHash: await bcrypt.hash(tempPassword(), 12),
+        passwordHash: await bcrypt.hash(temp, 12),
       });
+      credentials.push({ regNo: row.regNo, name: row.name, temporaryPassword: temp });
       created++;
     } catch (e) {
       errors.push({ row: i + 1, regNo: row.regNo, error: e.message });
@@ -289,7 +318,14 @@ r.post('/students/bulk', can('student:create'), wrap(async (req, res) => {
   }
 
   await audit(req, { action: 'student.bulk_created', entity: 'Student', after: { created } });
-  res.json({ created, errors });
+  res.json({
+    created,
+    errors,
+    /* Candidates cannot sit an examination without credentials, and
+       there is no mail server in the demonstration build. In
+       production these are emailed, never returned. */
+    credentials: process.env.NODE_ENV === 'production' ? undefined : credentials,
+  });
 }));
 
 r.patch('/students/:id', can('student:edit'), wrap(async (req, res) => {
@@ -356,6 +392,42 @@ r.post('/academic/batches', can('settings:create', 'staff:create'), wrap(async (
   res.status(201).json({ batch: { id: String(b._id), label: b.label } });
 }));
 
+/* A year is not created on its own — a year with no sections holds no
+   students. So a year is created as its sections: "III year, sections
+   A, B and C" is one action producing three classes. */
+r.post('/academic/batches/bulk', can('settings:create', 'staff:create'), wrap(async (req, res) => {
+  const body = parse(z.object({
+    departmentId: z.string(), programme: z.string(),
+    year: z.number().int().min(1).max(5),
+    sections: z.array(z.string().min(1)).min(1, 'Name at least one section'),
+    academicYear: z.string(), semester: z.number().int().min(1).max(10),
+  }), req.body);
+
+  const sections = [...new Set(body.sections.map((s) => s.trim().toUpperCase()).filter(Boolean))];
+  if (!sections.length) throw badRequest('Name at least one section');
+
+  const t = tenant(req);
+  const present = await Batch.find({
+    ...t, departmentId: body.departmentId, year: body.year, academicYear: body.academicYear,
+    section: { $in: sections },
+  }).select('section').lean();
+  const seen = new Set(present.map((b) => b.section));
+
+  const created = [];
+  for (const section of sections) {
+    if (seen.has(section)) continue;
+    /* One at a time, because the label is derived in a pre-validate
+       hook that `insertMany` would skip for a document with no label. */
+    const b = await Batch.create({
+      ...t, departmentId: body.departmentId, programme: body.programme,
+      year: body.year, section, academicYear: body.academicYear, semester: body.semester,
+    });
+    created.push({ id: String(b._id), label: b.label, section });
+  }
+
+  res.status(201).json({ created, alreadyPresent: sections.length - created.length, batches: created });
+}));
+
 r.post('/academic/subjects', can('settings:create', 'staff:create'), wrap(async (req, res) => {
   const body = parse(z.object({
     departmentId: z.string(), code: z.string().min(2), title: z.string().min(2),
@@ -396,6 +468,84 @@ r.post('/academic/mappings', can('staff:edit'), wrap(async (req, res) => {
   const m = await Mapping.create({ ...body, ...tenant(req) });
   await audit(req, { action: 'mapping.created', entity: 'Mapping', entityId: m._id, after: body });
   res.status(201).json({ mapping: { id: String(m._id) } });
+}));
+
+/* ============================================================
+   MAPPING IN ONE ACTION
+
+   A real allocation reads "Ravikumar takes Data Structures and
+   Fundamentals of Computing, for III CSE A, II CSE B and II CSE C" —
+   one decision, six rows. Posting them one at a time meant six
+   round trips, and any pair that already existed came back as a raw
+   duplicate-key error that stopped the rest.
+
+   So: one staff member, the subjects crossed with the classes,
+   already-present pairs counted rather than treated as failures.
+   ============================================================ */
+r.post('/academic/mappings/bulk', can('staff:edit'), wrap(async (req, res) => {
+  const body = parse(z.object({
+    staffId: z.string(),
+    subjectIds: z.array(z.string()).default([]),
+    batchIds: z.array(z.string()).min(1, 'Choose at least one class'),
+    kind: z.enum(['subject_staff', 'class_advisor']),
+    academicYear: z.string(),
+  }), req.body);
+
+  /* A class advisor advises the class, not a subject within it, so
+     the subject list is meaningless there and would otherwise
+     multiply the rows. */
+  const subjectIds = body.kind === 'class_advisor' ? [null] : body.subjectIds;
+  if (body.kind === 'subject_staff' && !subjectIds.length) {
+    throw badRequest('Choose at least one subject');
+  }
+  if (subjectIds.length * body.batchIds.length > 200) {
+    throw badRequest('That is more than 200 mappings at once. Split it by year.');
+  }
+
+  const staff = await User.findOne({ _id: body.staffId, ...tenant(req) }).select('name').lean();
+  if (!staff) throw notFound('Staff member not found');
+
+  const t = tenant(req);
+  const wanted = [];
+  for (const subjectId of subjectIds) {
+    for (const batchId of body.batchIds) {
+      wanted.push({ ...t, staffId: body.staffId, subjectId, batchId,
+                    kind: body.kind, academicYear: body.academicYear });
+    }
+  }
+
+  /* The unique index is the real guard; this only tells us which
+     pairs are new so the count reported back is honest. */
+  const present = await Mapping.find({
+    ...t, staffId: body.staffId, kind: body.kind, academicYear: body.academicYear,
+    batchId: { $in: body.batchIds },
+  }).select('subjectId batchId').lean();
+  const seen = new Set(present.map((m) => `${m.subjectId || ''}:${m.batchId}`));
+
+  const fresh = wanted.filter((w) => !seen.has(`${w.subjectId || ''}:${w.batchId}`));
+
+  let created = 0;
+  if (fresh.length) {
+    /* `ordered: false` so a row that races another request does not
+       abandon the remainder. */
+    try {
+      const made = await Mapping.insertMany(fresh, { ordered: false });
+      created = made.length;
+    } catch (e) {
+      created = e.result?.insertedCount ?? e.insertedDocs?.length ?? 0;
+      const other = (e.writeErrors || []).filter((w) => w.err?.code !== 11000);
+      if (other.length) throw badRequest(other[0].err?.errmsg || 'Some mappings could not be saved');
+    }
+  }
+
+  await audit(req, { action: 'mapping.bulk_created', entity: 'User', entityId: body.staffId,
+    after: { created, alreadyPresent: wanted.length - fresh.length, kind: body.kind } });
+
+  res.status(201).json({
+    created,
+    alreadyPresent: wanted.length - fresh.length,
+    staff: staff.name,
+  });
 }));
 
 r.delete('/academic/mappings/:id', can('staff:edit'), wrap(async (req, res) => {

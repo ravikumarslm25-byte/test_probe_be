@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
+    "test": "node scripts/check-routes.mjs && node --test src/test/*.test.js",
     "seed": "node src/seed/seed.js",
     "check-db": "node src/seed/check.js",
     "prod:start": "mkdir -p logs && NODE_ENV=production forever start --uid testprobe-api --minUptime 1000 --spinSleepTime 1000 -a -o \"$PWD/logs/out.log\" -e \"$PWD/logs/err.log\" src/index.js",
@@ -13,7 +14,8 @@
     "prod:stop": "forever stop testprobe-api",
     "prod:logs": "tail -n 100 -f logs/out.log logs/err.log",
     "prod:status": "forever list",
-    "demo:refresh": "node src/seed/refresh.js"
+    "demo:refresh": "node src/seed/refresh.js",
+    "check": "node scripts/check-routes.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -26,7 +28,9 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.7.0",
     "morgan": "^1.10.0",
-    "zod": "^3.23.8",
-    "ws": "^8.18.0"
+    "qrcode": "^1.5.4",
+    "sanitize-html": "^2.18.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
   }
 }

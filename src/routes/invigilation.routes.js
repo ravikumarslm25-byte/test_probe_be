@@ -8,7 +8,9 @@ import { wrap, notFound, forbidden, badRequest } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
 import { storage } from '../services/storage.js';
 import { VIOLATION_CATALOGUE } from '../utils/grading.js';
-import { pushToCandidate } from '../realtime/live.js';
+import { pushToCandidate, pushToRoom } from '../realtime/live.js';
+import { recomputeWritingUntil } from '../services/closeExam.js';
+import { gradeObjective } from '../services/finalise.js';
 import { examStartAt } from '../utils/time.js';
 import { syncExamStatuses } from '../utils/examStatus.js';
 
@@ -36,7 +38,14 @@ r.get('/rooms', can('invigilation:view'), wrap(async (req, res) => {
   const { filter, wide } = await roomsForActor(req);
 
   const rooms = await Room.find(filter)
-    .populate('examId', 'title code date startTime durationMinutes status timezone startsAt')
+    /* Every field `dueStatus` and the sweep read. Without
+       `writingUntil` the invigilator's own page decided a paper with
+       an outstanding extension was over AND WROTE THAT BACK — and
+       'evaluation' is workflow-driven, so nothing could put it
+       right. Without `blueprint` the sweep threw on every attempt and
+       sealed nothing. */
+    .populate('examId', 'title code date startTime durationMinutes status timezone startsAt passMark'
+      + ' blueprint writingUntil lastSittingEndsAt closedAt')
     .populate('invigilatorId', 'name')
     .sort({ startAt: -1 }).limit(120).lean();
 
@@ -134,6 +143,16 @@ r.get('/rooms/:roomId/wall', can('invigilation:view'), wrap(async (req, res) => 
       attemptId: String(a._id),
       student: a.studentId ? { name: a.studentId.name, regNo: a.studentId.regNo } : null,
       status: a.status,
+      /* Someone sitting at 14:00 when the hall emptied at 12:00 looks
+         like a fault on the wall unless the wall says otherwise. */
+      sitting: a.sitting?.startsAt
+        ? {
+          startsAt: a.sitting.startsAt,
+          endsAt: new Date(new Date(a.sitting.startsAt).getTime()
+            + (a.sitting.durationMinutes || a.examId?.durationMinutes || 0) * 60000),
+          reason: a.sitting.reason,
+        }
+        : null,
       state,
       flagScore: a.flagScore || 0,
       ceiling,
@@ -206,6 +225,14 @@ r.get('/attempts/:id', can('invigilation:view'), wrap(async (req, res) => {
       student: attempt.studentId,
       exam: attempt.examId,
       room: attempt.roomId ? { name: attempt.roomId.name } : null,
+      sitting: attempt.sitting?.startsAt
+        ? {
+          startsAt: attempt.sitting.startsAt,
+          endsAt: new Date(new Date(attempt.sitting.startsAt).getTime()
+            + (attempt.sitting.durationMinutes || attempt.examId?.durationMinutes || 0) * 60000),
+          reason: attempt.sitting.reason,
+        }
+        : null,
       startedAt: attempt.startedAt,
       timerEndsAt: attempt.timerEndsAt,
       flagScore: attempt.flagScore,
@@ -309,12 +336,44 @@ r.post('/attempts/:id/message', can('invigilation:edit'), wrap(async (req, res) 
   const { body } = parse(z.object({ body: z.string().min(1).max(600) }), req.body);
 
   const at = now();
-  /* Marked read straight away when the socket delivers it, so the
-     heartbeat does not deliver the same message a second time. */
+
+  /* Written BEFORE it is delivered. Pushing first meant the candidate
+     could have the message on screen while the save behind it failed
+     — the heartbeat saves this same document every few seconds, so a
+     version conflict here is ordinary — leaving a message the
+     candidate saw, the transcript never recorded, and the invigilator
+     was never told about.
+
+     `$push` rather than save(), for the same reason: it is atomic
+     against the heartbeat instead of racing it. */
+  await Attempt.updateOne(
+    { _id: attempt._id, ...tenant(req) },
+    { $push: { chat: { from: 'invigilator', body, at, readByStudent: false } } },
+  );
+
   const delivered = pushToCandidate(attempt._id, { type: 'chat', from: 'invigilator', body, at });
 
-  attempt.chat.push({ from: 'invigilator', body, at, readByStudent: delivered });
-  await attempt.save();
+  /* Marked read only once the socket has actually taken it, so an
+     undelivered message still rides the heartbeat and a delivered one
+     is never sent twice. */
+  if (delivered) {
+    await Attempt.updateOne(
+      { _id: attempt._id, ...tenant(req) },
+      { $set: { 'chat.$[m].readByStudent': true } },
+      { arrayFilters: [{ 'm.at': at, 'm.from': 'invigilator' }] },
+    );
+  }
+
+  /* The other proctors on the room see it too, including the sender,
+     whose own panel shows it the moment it is sent. This used to come
+     from a second socket relay that also hit the candidate — which is
+     what made every message appear twice on their screen. */
+  if (attempt.roomId) {
+    pushToRoom(attempt.roomId._id || attempt.roomId, {
+      type: 'chat', attemptId: String(attempt._id), from: 'invigilator', body, at,
+    });
+  }
+
   res.json({ ok: true, delivered });
 }));
 
@@ -371,6 +430,17 @@ r.post('/attempts/:id/terminate', can('invigilation:edit'), wrap(async (req, res
   attempt.status = 'terminated';
   attempt.terminationReason = `${reason} — ${req.actor.name}`;
   attempt.submittedAt = now();
+
+  /* Graded on the way out, exactly as the automatic disqualification
+     at the flag ceiling already does. Without this the script sat in
+     the queue with nothing marked and a total of zero, which blocked
+     publishing the whole paper until someone forced it — and an
+     appeal had no record of what the candidate had actually got
+     right. `decidePass` keeps a disqualification off the pass list
+     whatever the marks come to. */
+  const exam = await Exam.findById(attempt.examId);
+  if (exam) await gradeObjective(attempt, exam);
+
   await attempt.save();
 
   pushToCandidate(attempt._id, { type: 'terminated', reason: attempt.terminationReason });
@@ -395,6 +465,15 @@ r.post('/attempts/:id/extend', can('invigilation:edit'), wrap(async (req, res) =
   attempt.timeExtension = { minutes, reason, approvedBy: req.actor.id, at: now() };
   await attempt.save();
 
+  /* The paper has to know someone is still writing past its own end,
+     or its status flips to evaluation underneath them and it drops
+     off the invigilator's wall while they are being proctored. */
+  const exam = await Exam.findById(attempt.examId);
+  if (exam) {
+    await recomputeWritingUntil(exam);
+    await exam.save();
+  }
+
   await audit(req, {
     action: 'invigilation.time_extended', entity: 'Attempt', entityId: attempt._id,
     after: { minutes, reason },
@@ -412,15 +491,33 @@ r.post('/rooms/:roomId/broadcast', can('invigilation:edit'), wrap(async (req, re
 
   const live = await Attempt.find({ roomId: room._id, status: 'in_progress' }).select('_id').lean();
   const at = now();
-  for (const a of live) pushToCandidate(a._id, { type: 'chat', from: 'invigilator', body, at });
 
-  const result = await Attempt.updateMany(
-    { roomId: room._id, status: 'in_progress' },
-    { $push: { chat: { from: 'invigilator', body, at, readByStudent: true } } },
-  );
+  /* Marked read only for the candidates whose socket actually took
+     it. Writing `readByStudent: true` for everyone meant a candidate
+     whose connection was down — the one person who most needed
+     "fifteen minutes remaining" — had it recorded as delivered, and
+     the heartbeat, which only resends unread messages, never brought
+     it to them. */
+  const got = [];
+  const missed = [];
+  for (const a of live) {
+    (pushToCandidate(a._id, { type: 'chat', from: 'invigilator', body, at }) ? got : missed)
+      .push(a._id);
+  }
 
-  await audit(req, { action: 'invigilation.broadcast', entity: 'Room', entityId: room._id, after: { body } });
-  res.json({ ok: true, delivered: result.modifiedCount });
+  for (const [ids, read] of [[got, true], [missed, false]]) {
+    if (!ids.length) continue;
+    await Attempt.updateMany(
+      { _id: { $in: ids } },
+      { $push: { chat: { from: 'invigilator', body, at, readByStudent: read } } },
+    );
+  }
+  const result = { modifiedCount: live.length };
+
+  await audit(req, { action: 'invigilation.broadcast', entity: 'Room', entityId: room._id,
+    after: { body, onScreenNow: got.length, waitingForReconnect: missed.length } });
+  res.json({ ok: true, delivered: result.modifiedCount,
+             onScreenNow: got.length, waitingForReconnect: missed.length });
 }));
 
 export default r;

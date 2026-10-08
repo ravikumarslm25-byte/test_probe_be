@@ -74,6 +74,27 @@ const examSchema = new Schema({
     default: 'draft', index: true,
   },
   sealedUntil: Date,
+  /* How many candidates have a window of their own, and when the last
+     of them finishes. Kept on the paper so its status can be derived
+     without counting attempts on every read — a paper whose alternate
+     sitting runs to 16:00 must not file itself under past papers at
+     12:45 and take the invigilator's wall with it. */
+  alternateSittings: { type: Number, default: 0 },
+  lastSittingEndsAt: Date,
+
+  /* The last moment ANYONE may still legitimately be writing: the
+     paper's own end, the latest alternate sitting, or the latest
+     extension an invigilator has granted. The status is derived from
+     this rather than from the paper's nominal end, so a paper does
+     not read "In progress" while nobody is in the hall — nor go quiet
+     while two people are finishing on extra time. */
+  writingUntil: Date,
+
+  /* Ended by hand, from the wall or the examinations list. Once set,
+     the paper is over whatever the clock says. */
+  closedAt: Date,
+  closedBy: ref('User'),
+  closeReason: String,
   publishedAt: Date,
   resultsPublishedAt: Date,
   createdBy: ref('User'),
@@ -137,10 +158,50 @@ const questionSchema = new Schema({
   markingGuidance: String,
 
   unit: String,
+  topic: String,
   difficulty: { type: String, enum: ['easy', 'moderate', 'hard'], default: 'moderate' },
   createdBy: ref('User'),
+
+  /* ---------------- the bank ----------------
+     A question with no examId lives in the bank only. Subject staff
+     write them weeks ahead, the examination cell approves them, and a
+     paper is assembled from what is already approved — which is the
+     whole point: the cell cannot be waiting on authors the week an
+     examination is scheduled.
+
+     A paper takes a COPY of the bank question, never a reference. A
+     bank question edited or withdrawn next term must not alter a
+     paper that has already been sat, and a paper needs its own order
+     and set label. `sourceId` points back so the bank can show where
+     a question has been used. */
+  sourceId: ref('Question'),
+  /* Which bulk upload a BANK question arrived in. A subject's bank is
+     built over a term in several batches — one per unit, or one per
+     member of staff — and the examination cell assembles a paper from
+     a particular batch, not from an undifferentiated heap. Empty for
+     a question written by hand. */
+  uploadId: ref('QuestionUpload'),
+
+  status: {
+    type: String,
+    enum: ['draft', 'pending_review', 'approved', 'rejected', 'retired'],
+    default: 'draft',
+    index: true,
+  },
+  reviewedBy:  ref('User'),
+  reviewedAt:  Date,
+  reviewNote:  String,
+  submittedAt: Date,
+
+  /* How many papers have drawn this question, so an author can see
+     what is overused and a cell can retire a question that has been
+     round too often. */
+  usedCount: { type: Number, default: 0 },
+  lastUsedAt: Date,
 }, { timestamps: true });
 questionSchema.index({ institutionId: 1, examId: 1, section: 1, order: 1 });
+/* The bank's own read path: a subject's approved questions, newest first. */
+questionSchema.index({ institutionId: 1, subjectId: 1, status: 1, examId: 1 });
 
 /* ---------------- Room ---------------- */
 const roomSchema = new Schema({
@@ -162,7 +223,10 @@ const answerSchema = new Schema({
   selected: [String],        // mcq
   text: String,              // fib / typed desc
   html: String,              // rich text desc
-  scanPages: [{ key: String, page: Number, uploadedAt: Date }],
+  /* `mime` matters: a page uploaded from a phone scanner is a PDF,
+     and the evaluator's viewer has to know not to render it in an
+     <img>. Older rows have no mime and are images by definition. */
+  scanPages: [{ key: String, page: Number, uploadedAt: Date, mime: String, bytes: Number, name: String }],
   mode: { type: String, enum: ['typed', 'scanned', 'mixed'], default: 'typed' },
   markedForReview: { type: Boolean, default: false },
   answeredAt: Date,
@@ -283,7 +347,18 @@ const attemptSchema = new Schema({
 
   evaluation: {
     state: { type: String, enum: ['pending', 'in_review', 'submitted'], default: 'pending', index: true },
-    evaluatorId: { type: Types.ObjectId, ref: 'User' },
+    /* Who this script is ALLOCATED to. Allocation happens after the
+       examination, not when the paper is built: until the sitting is
+       over nobody knows how many scripts there are, how many were
+       terminated, or which staff are free that week. Empty means
+       nobody has been given it yet. */
+    evaluatorId: { type: Types.ObjectId, ref: 'User', index: true },
+    allocatedBy: { type: Types.ObjectId, ref: 'User' },
+    allocatedAt: Date,
+    /* Who actually entered and submitted the marks. Normally the
+       allocated evaluator; the examination cell can step in, and the
+       record should say so. */
+    submittedBy: { type: Types.ObjectId, ref: 'User' },
     submittedAt: Date,
     cycles: [{
       cycle: Number,
@@ -294,6 +369,21 @@ const attemptSchema = new Schema({
       newTotal: Number,
       at: { type: Date, default: Date.now },
     }],
+  },
+
+  /* A window of this candidate's own.
+
+     Not an extension — an extension stretches the examination's
+     window and still hangs off its start. This REPLACES it: the same
+     paper, the same marks, the same proctoring, at a time arranged
+     for one candidate who cannot sit with the hall. Empty for
+     everyone else, which is almost everyone. */
+  sitting: {
+    startsAt: { type: Date, index: true },
+    durationMinutes: Number,          // defaults to the examination's
+    reason: String,
+    grantedBy: { type: Types.ObjectId, ref: 'User' },
+    grantedAt: Date,
   },
 
   resultPublishedAt: Date,
@@ -333,6 +423,55 @@ const ticketSchema = new Schema({
 /* ---------------- Audit ----------------
    Every privileged action lands here. This is what lets the
    Controller answer a challenge to any result.                */
+/* ---------------- A batch of uploaded questions ----------------
+   One spreadsheet, uploaded once. Kept as a record of its own so the
+   bank can be read the way it was built — "Unit I and II, uploaded by
+   Dr Mani on 3 October, 40 questions" — rather than as four hundred
+   undifferentiated rows. Deleting the batch record never deletes its
+   questions; it is a label, not an owner. */
+const questionUploadSchema = new Schema({
+  institutionId: ref('Institution', { required: true }),
+  subjectId: ref('Subject', { required: true }),
+  label:     { type: String, required: true },
+  fileName:  String,
+  count:     { type: Number, default: 0 },
+  bySection: { A: { type: Number, default: 0 }, B: { type: Number, default: 0 }, C: { type: Number, default: 0 } },
+  units:     [String],
+  createdBy: ref('User'),
+}, { timestamps: true });
+questionUploadSchema.index({ institutionId: 1, subjectId: 1, createdAt: -1 });
+
+/* ---------------- Upload pass ----------------
+   The candidate's answer arrives from their own phone, not from the
+   examination machine. Rather than ship a mobile application, the
+   examination page shows a QR code; the phone opens the address
+   inside it and uploads there.
+
+   The token in that address IS the credential — the phone is not
+   signed in and must not have to be, in a hall where three hundred
+   candidates are each holding one. So the token is single-purpose and
+   short-lived: one attempt, one question, a handful of files, and
+   gone within minutes. `expiresAt` carries a TTL index, so an unused
+   pass removes itself rather than lingering as a way into a script.  */
+const uploadPassSchema = new Schema({
+  institutionId: ref('Institution', { required: true }),
+  token:      { type: String, required: true, unique: true },
+  attemptId:  ref('Attempt', { required: true }),
+  examId:     ref('Exam', { required: true }),
+  studentId:  ref('Student', { required: true }),
+  questionId: ref('Question', { required: true }),
+  section:    String,
+  questionNumber: Number,
+  files: [{ key: String, mime: String, bytes: Number, name: String, uploadedAt: Date }],
+  maxFiles:  { type: Number, default: 6 },
+  closedAt:  Date,
+  usedFromIp: String,
+  usedFromAgent: String,
+  expiresAt: { type: Date, required: true },
+}, { timestamps: true });
+uploadPassSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+uploadPassSchema.index({ attemptId: 1, questionId: 1 });
+
 const auditSchema = new Schema({
   institutionId: ref('Institution', { required: true }),
   actorId:   { type: Types.ObjectId },
@@ -352,4 +491,6 @@ export const Question = model('Question', questionSchema);
 export const Room     = model('Room', roomSchema);
 export const Attempt  = model('Attempt', attemptSchema);
 export const Ticket   = model('Ticket', ticketSchema);
+export const UploadPass = model('UploadPass', uploadPassSchema);
+export const QuestionUpload = model('QuestionUpload', questionUploadSchema);
 export const Audit    = model('Audit', auditSchema);

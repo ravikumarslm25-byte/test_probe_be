@@ -7,7 +7,10 @@ import { authenticate, can, tenant, resolveScope } from '../middleware/auth.js';
 import { wrap, notFound, badRequest } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
 import { VIOLATION_CATALOGUE } from '../utils/grading.js';
-import { examStartAt } from '../utils/time.js';
+import { sittingFor } from '../utils/sitting.js';
+import {
+  attendanceState, isPresent, lateByMinutes, isLate, minutesSat, howItEnded,
+} from '../utils/attendance.js';
 
 const r = Router();
 r.use(authenticate);
@@ -34,9 +37,13 @@ export const REPORTS = [
   { key: 'schedule',     name: 'Schedule and room register',
     desc: 'Every examination by date and room with allocation, invigilator coverage and completion',
     filters: ['department', 'dateRange'] },
-  { key: 'attendance',   name: 'Attendance register',
+  { key: 'attendance',   name: 'Attendance register — summary',
     desc: 'Present, absent, late entry and disqualified counts by examination, room and batch',
     filters: ['department', 'batch', 'exam', 'dateRange'] },
+  { key: 'attendance-detail', name: 'Attendance register — candidate by candidate',
+    desc: 'One row per candidate: class, room, register number, present or absent, when they '
+      + 'joined, when they left, how long they sat and whether they were late',
+    filters: ['department', 'batch', 'exam', 'room', 'presence', 'student', 'dateRange'] },
   { key: 'outcome',      name: 'Pass and fail analysis',
     desc: 'Outcome by subject, batch and department against the configured pass mark',
     filters: ['department', 'batch', 'subject', 'dateRange'] },
@@ -62,6 +69,16 @@ const filterSchema = z.object({
   studentId: z.string().optional(),
   from: z.string().optional(),
   to: z.string().optional(),
+  roomId: z.string().optional(),
+  /* A register number, because that is what the examination cell has
+     in front of them — not an internal id. The 'student' filter was
+     declared on the student report and had no control on the page at
+     all, so that report could never be narrowed to one candidate. */
+  regNo: z.string().max(40).optional(),
+  /* The register is read two ways: the whole hall, or just the people
+     who are not in it. An examination cell chasing absentees wants
+     the second without reading past three hundred rows. */
+  presence: z.enum(['all', 'present', 'absent', 'late', 'disqualified']).optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
   threshold: z.coerce.number().min(0).optional(),
 });
@@ -96,11 +113,13 @@ async function examScope(req, f) {
 
 r.get('/', can('report:view'), wrap(async (req, res) => {
   const t = tenant(req);
-  const [departments, batches, subjects, exams] = await Promise.all([
+  const [departments, batches, subjects, exams, rooms] = await Promise.all([
     Department.find(t).select('name code').sort({ name: 1 }).lean(),
     Batch.find(t).select('label').sort({ year: 1, section: 1 }).lean(),
     Subject.find(t).select('code title').sort({ code: 1 }).lean(),
     Exam.find(t).select('title code date').sort({ date: -1 }).limit(60).lean(),
+    Room.find(t).select('name examId').populate('examId', 'code date')
+      .sort({ name: 1 }).limit(300).lean(),
   ]);
 
   res.json({
@@ -110,6 +129,10 @@ r.get('/', can('report:view'), wrap(async (req, res) => {
       batches: batches.map((b) => ({ id: String(b._id), label: b.label })),
       subjects: subjects.map((s) => ({ id: String(s._id), label: `${s.code} — ${s.title}` })),
       exams: exams.map((e) => ({ id: String(e._id), label: `${e.code} · ${e.date}` })),
+      rooms: rooms.map((r2) => ({
+        id: String(r2._id),
+        label: r2.examId ? `${r2.name} · ${r2.examId.code} ${r2.examId.date}` : r2.name,
+      })),
     },
   });
 }));
@@ -132,6 +155,9 @@ const builders = {
     const sFilter = { ...tenant(req) };
     if (f.batchId) sFilter.batchId = oid(f.batchId);
     if (f.studentId) sFilter._id = oid(f.studentId);
+    if (f.regNo && f.regNo.trim()) {
+      sFilter.regNo = new RegExp(f.regNo.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    }
     if (f.departmentId) sFilter.departmentId = oid(f.departmentId);
 
     const scope = await resolveScope(req.actor);
@@ -359,26 +385,211 @@ const builders = {
     };
   },
 
+  /* ---- R5b attendance, candidate by candidate ----
+
+     The summary register answers "how many turned up". This answers
+     "who", which is what the examination cell actually signs and
+     files: every candidate on one line, with the class and room they
+     sat in, when they joined, when they left, and how long they were
+     in front of the paper.
+
+     Built from the attempt rather than from a presence flag, because
+     there is no presence flag — attendance is a reading of the
+     timestamps the proctoring already records, and it has to be
+     derived the same way every time. */
+  async attendanceDetail(req, f) {
+    const exams = await examScope(req, f);
+    const institution = await Institution.findById(req.actor.institutionId).lean();
+    const lateAfter = institution?.settings?.entryCutoffMinutes ?? 15;
+
+    const examIds = exams.map((e) => e._id);
+    const byExam = new Map(exams.map((e) => [String(e._id), e]));
+
+    const attemptFilter = { examId: { $in: examIds }, ...tenant(req) };
+    if (f.roomId) attemptFilter.roomId = oid(f.roomId);
+    if (f.studentId) attemptFilter.studentId = oid(f.studentId);
+    if (f.regNo && f.regNo.trim()) {
+      const esc = f.regNo.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const who = await Student.find({ ...tenant(req), regNo: new RegExp(esc, 'i') })
+        .select('_id').lean();
+      attemptFilter.studentId = { $in: who.map((x) => x._id) };
+    }
+
+    /* One row per candidate per examination, so this grows as the
+       product of the two. Sixty papers of three hundred is eighteen
+       thousand rows with a deep populate on each — enough to hold the
+       API up. Capped, and the cap is REPORTED rather than quietly
+       truncating a register someone is about to sign. */
+    const CAP = 5000;
+    const total = await Attempt.countDocuments(attemptFilter);
+
+    const attempts = await Attempt.find(attemptFilter)
+      .limit(CAP)
+      .populate({ path: 'studentId', select: 'name regNo batchId departmentId',
+        populate: [{ path: 'batchId', select: 'label year section' },
+          { path: 'departmentId', select: 'name code' }] })
+      .populate({ path: 'roomId', select: 'name invigilatorId',
+        populate: { path: 'invigilatorId', select: 'name' } })
+      .lean();
+
+    const hhmm = (d) => (d
+      ? new Date(d).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+      : '');
+    const mins = (a, b) => (a && b ? Math.round((new Date(b) - new Date(a)) / 60000) : '');
+
+    let rows = attempts.map((a) => {
+      const ex = byExam.get(String(a.examId));
+      const sitting = sittingFor(a, ex || {});
+
+      const state = attendanceState(a);
+      const lateBy = lateByMinutes(a, ex);
+
+      const batch = a.studentId?.batchId;
+
+      return {
+        /* sorting keys, not columns */
+        _date: ex?.date || '',
+        _room: a.roomId?.name || '',
+        _reg: a.studentId?.regNo || '',
+        _state: state,
+        _late: isLate(a, ex, lateAfter),
+
+        date: ex?.date || '',
+        exam: ex ? `${ex.code} — ${ex.title}` : '',
+        department: a.studentId?.departmentId?.name || '',
+        batch: batch?.label || '',
+        room: a.roomId?.name || '—',
+        invigilator: a.roomId?.invigilatorId?.name || '',
+        regNo: a.studentId?.regNo || '',
+        name: a.studentId?.name || '',
+        status: state,
+        /* Three different moments, and the difference between them is
+           the point: joined is when they reached the verification
+           screen, started is when the paper opened, exit is when it
+           closed — by submission or by the invigilator. */
+        joinedAt: hhmm(a.joinedAt),
+        startedAt: hhmm(a.startedAt),
+        exitAt: hhmm(a.submittedAt),
+        minutes: minutesSat(a) ?? '',
+        lateBy: lateBy ?? '',
+        identity: a.identity?.verifiedAt ? 'Verified' : (a.startedAt ? 'Not verified' : ''),
+        flags: a.flagScore || 0,
+        exitBy: howItEnded(a),
+        sitting: sitting.isAlternate
+          ? `${hhmm(sitting.startAt)}–${hhmm(sitting.endsAt)}`
+          : '',
+      };
+    });
+
+    if (f.presence && f.presence !== 'all') {
+      const want = {
+        present: (r2) => isPresent(r2._state),
+        absent: (r2) => r2._state === 'Absent',
+        late: (r2) => r2._late,
+        disqualified: (r2) => r2._state === 'Disqualified',
+      }[f.presence];
+      rows = rows.filter(want);
+    }
+
+    /* Date, then examination, then room, then register number — so
+       the printed register reads room by room, which is how it is
+       signed and filed. */
+    rows.sort((x, y) => y._date.localeCompare(x._date)
+      || x.exam.localeCompare(y.exam)
+      || x._room.localeCompare(y._room, undefined, { numeric: true })
+      || x._reg.localeCompare(y._reg, undefined, { numeric: true }));
+
+    const count = (fn) => rows.filter(fn).length;
+    const present = count((r2) => isPresent(r2._state));
+    const absent = count((r2) => r2._state === 'Absent');
+    const disqualified = count((r2) => r2._state === 'Disqualified');
+
+    /* The per-room and per-class breakdown the cell reads alongside
+       the register — "Room 2 was 28 of 30" — without counting rows. */
+    const group = (keyOf, label) => {
+      const by = new Map();
+      for (const r2 of rows) {
+        const k = keyOf(r2) || '—';
+        if (!by.has(k)) by.set(k, { group: k, scheduled: 0, present: 0, absent: 0, disqualified: 0, late: 0 });
+        const g = by.get(k);
+        g.scheduled += 1;
+        if (isPresent(r2._state)) g.present += 1;
+        else if (r2._state === 'Absent') g.absent += 1;
+        if (r2._state === 'Disqualified') g.disqualified += 1;
+        if (r2._late) g.late += 1;
+      }
+      return [...by.values()]
+        .map((g) => ({ ...g, attendance: pct(g.present + g.disqualified, g.scheduled), label }))
+        .sort((a, b) => String(a.group).localeCompare(String(b.group), undefined, { numeric: true }));
+    };
+
+    const byRoom = group((r2) => r2.room, 'Room');
+    const byBatch = group((r2) => r2.batch, 'Class');
+
+    return {
+      title: 'Attendance register — candidate by candidate',
+      subtitle: `${rows.length} candidate record(s) across ${exams.length} examination(s)`
+        + (f.presence && f.presence !== 'all' ? ` · showing ${f.presence} only` : '')
+        + (total > CAP
+          ? ` · ONLY THE FIRST ${CAP} OF ${total} — narrow by examination, room or date`
+          : ''),
+      columns: [
+        T('date', 'Date'), T('exam', 'Examination'), T('department', 'Department'),
+        T('batch', 'Class'), T('room', 'Room'), T('invigilator', 'Invigilator'),
+        T('regNo', 'Register number'), T('name', 'Candidate'), T('status', 'Present / absent'),
+        T('joinedAt', 'Joined'), T('startedAt', 'Started'), T('exitAt', 'Exit'),
+        N('minutes', 'Minutes'), N('lateBy', 'Late by (min)'),
+        T('identity', 'Identity'), N('flags', 'Flags'),
+        T('exitBy', 'How it ended'), T('sitting', 'Own sitting'),
+      ],
+      rows,
+      summary: {
+        Candidates: rows.length,
+        Present: present,
+        Absent: absent,
+        Disqualified: disqualified,
+        'Late entry': count((r2) => r2._late),
+        'Attendance %': pct(present + disqualified, rows.length),
+      },
+      extra: {
+        title: 'By room, then by class',
+        columns: [T('label', 'Grouped by'), T('group', 'Room or class'), N('scheduled', 'Scheduled'),
+          N('present', 'Present'), N('absent', 'Absent'), N('disqualified', 'Disqualified'),
+          N('late', 'Late'), N('attendance', 'Attendance %')],
+        rows: [...byRoom, ...byBatch],
+      },
+    };
+  },
+
   /* ---- R5 attendance ---- */
   async attendance(req, f) {
     const exams = await examScope(req, f);
+    const institution = await Institution.findById(req.actor.institutionId).lean();
+    const lateCutoff = institution?.settings?.entryCutoffMinutes ?? 15;
     const rows = [];
 
     for (const ex of exams) {
       const attempts = await Attempt.find({ examId: ex._id }).lean();
-      const absent = attempts.filter((a) => a.status === 'not_started').length;
-      const late = attempts.filter((a) =>
-        a.startedAt && new Date(a.startedAt) > examStartAt(ex).getTime() + 15 * 60000).length;
+      /* The same reading as the detailed register, through the same
+         helpers. The two disagreeing by one is the kind of thing a
+         controller of examinations notices and nobody can explain.
+
+         It also used to call anyone who started more than fifteen
+         minutes after the EXAMINATION late — which made a candidate
+         sitting at 14:00 by arrangement four hours late. */
+      const states = attempts.map((a) => attendanceState(a));
+      const absent = states.filter((x) => x === 'Absent').length;
+      const late = attempts.filter((a) => isLate(a, ex, lateCutoff)).length;
 
       rows.push({
         date: ex.date,
         exam: `${ex.code} — ${ex.title}`,
         batches: (ex.batchIds || []).map((b) => b.label).join(', '),
         scheduled: attempts.length,
-        present: attempts.filter((a) => ['in_progress', 'submitted', 'flagged'].includes(a.status)).length,
+        present: states.filter((x) => isPresent(x)).length,
         absent,
         late,
-        disqualified: attempts.filter((a) => a.status === 'terminated').length,
+        disqualified: states.filter((x) => x === 'Disqualified').length,
         attendance: pct(attempts.length - absent, attempts.length),
       });
     }
@@ -625,7 +836,7 @@ const builders = {
         passRate: pct(passed, evaluated.length),
         mean: totals.length ? round(totals.reduce((s, n) => s + n, 0) / totals.length) : 0,
         violations: attempts.reduce((s, a) => s + (a.violations?.length || 0), 0),
-        disqualified: attempts.filter((a) => a.status === 'terminated').length,
+        disqualified: states.filter((x) => x === 'Disqualified').length,
       });
     }
 
@@ -653,8 +864,14 @@ const builders = {
 /* ============================================================
    RUN + EXPORT
    ============================================================ */
+/* The catalogue uses hyphenated keys; the builders are plain
+   identifiers. One map rather than a property name that cannot be
+   written as one. */
+const BUILDER_KEY = { 'attendance-detail': 'attendanceDetail' };
+const builderFor = (key) => builders[BUILDER_KEY[key] || key];
+
 r.get('/:key', can('report:view'), wrap(async (req, res) => {
-  const build = builders[req.params.key];
+  const build = builderFor(req.params.key);
   if (!build) throw notFound(`No report called "${req.params.key}"`);
 
   const f = parse(filterSchema, req.query);
@@ -669,7 +886,7 @@ r.get('/:key', can('report:view'), wrap(async (req, res) => {
 }));
 
 r.get('/:key/export', can('report:view'), wrap(async (req, res) => {
-  const build = builders[req.params.key];
+  const build = builderFor(req.params.key);
   if (!build) throw notFound(`No report called "${req.params.key}"`);
 
   const format = (req.query.format || 'csv').toLowerCase();

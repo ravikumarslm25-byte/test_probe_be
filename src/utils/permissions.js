@@ -20,13 +20,14 @@ const ROLE_SPECS = [
       ...['exam','question','schedule','invigilation','evaluation','result','report','student','staff']
         .map(m => `${m}:view`),
       'result:approve', 'result:publish', 'evaluation:approve', 'exam:approve',
+      'question:approve',
     ] },
 
   { name: 'Examination Coordinator', scope: 'institution',
     description: 'Creates, schedules and publishes examinations',
     permissions: [
       'exam:view','exam:create','exam:edit','exam:delete','exam:publish',
-      'question:view','question:create','question:edit','question:delete',
+      'question:view','question:create','question:edit','question:delete','question:approve',
       'schedule:view','schedule:create','schedule:edit','schedule:delete','schedule:publish',
       'invigilation:view','invigilation:edit',
       'evaluation:view','evaluation:edit','evaluation:approve',

@@ -60,6 +60,16 @@ export const env = {
      the API's. */
   publicUrl: publicUrl(),
 
+  /* Where the WEB APP is reachable — a different host from the API in
+     any real deployment (examprobe.com against api.examprobe.com).
+     The answer-upload QR code points at a page of the web app, so a
+     code built from the API's own address would open a blank page on
+     the candidate's phone. Defaults to the first CORS origin, which
+     is the web app by definition. */
+  appUrl: (process.env.APP_URL
+    || (process.env.CORS_ORIGINS || 'http://localhost:5173').split(',')[0]
+  ).trim().replace(/\/+$/, ''),
+
   /* WebRTC. Public STUN is enough for a candidate and an invigilator on
      the same network, which covers a campus and covers testing. A TURN
      server is required once either side sits behind a symmetric NAT,

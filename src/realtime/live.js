@@ -84,10 +84,14 @@ const monitors = new Map();
    a candidate never appeared online; the server should simply say. */
 const log = (...a) => console.log('[ws]', ...a);
 
+/* Reports whether the message actually went. It matters for chat:
+   the sender marks a message read-by-student when the socket
+   delivered it, and a silent failure there would lose the message
+   rather than let the heartbeat carry it. */
 const send = (socket, payload) => {
-  if (socket.readyState === 1) {
-    try { socket.send(JSON.stringify(payload)); } catch { /* closing */ }
-  }
+  if (!socket || socket.readyState !== 1) return false;
+  try { socket.send(JSON.stringify(payload)); return true; }
+  catch { return false; }
 };
 
 async function authenticate(token) {
@@ -357,18 +361,16 @@ export function attachRealtime(server) {
           return;
         }
 
+        /* The same duplicate, in the other direction. The candidate's
+           screen sent a message over the socket AND posted it, and
+           POST /attempts/:id/chat pushes it to the watchers itself —
+           so an invigilator received every candidate message twice.
+           It was invisible only because the monitoring panel
+           de-duplicates its own view, which is a crutch, not a fix. */
         if (msg.type === 'chat' && socket.attemptId) {
-          const entry = candidates.get(socket.attemptId);
-          if (!entry) return;
-          const payload = JSON.stringify({
-            type: 'chat', attemptId: socket.attemptId, from: 'student',
-            body: msg.body, at: Date.now(),
-          });
-          for (const w of new Set([...roomWatchers(entry.roomId), ...entry.focusWatchers])) {
-            if (w.readyState === 1) { try { w.send(payload); } catch { /* closing */ } }
-          }
           return;
         }
+
 
         if (msg.type === 'frame' && socket.attemptId) {
           const entry = candidates.get(socket.attemptId);
@@ -495,20 +497,17 @@ export function attachRealtime(server) {
         return;
       }
 
+      /* Chat used to be relayed here as well as through the REST
+         route, and the invigilator's screen sent BOTH — so every
+         message reached the candidate twice and appeared twice on
+         their screen. The invigilator's own panel hid it, because
+         that one de-duplicates; the candidate's did not.
+
+         One path now: POST /invigilation/attempts/:id/message
+         writes it, pushes it to the candidate, and echoes it to the
+         other proctors. Relaying it here as well is what caused the
+         duplicate, so this no longer delivers anything. */
       if (msg.type === 'chat') {
-        const entry = candidates.get(msg.attemptId);
-        if (entry) {
-          send(entry.socket, {
-            type: 'chat', from: 'invigilator', body: msg.body, at: Date.now(),
-          });
-        }
-        // echo to every invigilator on the room so a second proctor sees it
-        for (const m of monitors.get(socket.roomId) || []) {
-          if (m !== socket) {
-            send(m, { type: 'chat', attemptId: msg.attemptId, from: 'invigilator',
-                      body: msg.body, at: Date.now() });
-          }
-        }
         return;
       }
 
@@ -569,8 +568,10 @@ export function attachRealtime(server) {
 export function pushToCandidate(attemptId, payload) {
   const entry = candidates.get(String(attemptId));
   if (!entry) return false;
-  send(entry.socket, payload);
-  return true;
+  /* The real answer, not "there was an entry". A socket mid-close
+     looks present and swallows the message; reporting success there
+     marked a chat message delivered that nobody ever saw. */
+  return send(entry.socket, payload);
 }
 
 export function pushToWatchers(attemptId, payload) {

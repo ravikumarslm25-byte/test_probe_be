@@ -1,14 +1,16 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Exam, Question, Room, Attempt } from '../models/exam.js';
-import { Student, Subject, Batch, Institution, User } from '../models/core.js';
+import { Student, Institution } from '../models/core.js';
 import { authenticate, can, tenant, resolveScope } from '../middleware/auth.js';
 import { samplePaper } from '../data/sample-bank.js';
 import { audit } from '../middleware/audit.js';
 import { wrap, notFound, badRequest, conflict, forbidden } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
 import { syncExamStatuses, syncExamStatus } from '../utils/examStatus.js';
-import { examStartAt, DEFAULT_TIMEZONE } from '../utils/time.js';
+import { examStartAt, zonedToUtc, DEFAULT_TIMEZONE } from '../utils/time.js';
+import { sittingFor, lastSittingEnd } from '../utils/sitting.js';
+import { closeExam, mayContinue, recomputeWritingUntil } from '../services/closeExam.js';
 import { storage } from '../services/storage.js';
 
 const r = Router();
@@ -59,6 +61,10 @@ r.get('/', can('exam:view'), wrap(async (req, res) => {
       date: e.date, startTime: e.startTime, durationMinutes: e.durationMinutes,
       totalMarks: e.totalMarks, passMark: e.passMark,
       status: e.status,
+      /* So the list can say at a glance that this paper has
+         candidates sitting outside the hall's window. */
+      alternateSittings: e.alternateSittings || 0,
+      lastSittingEndsAt: e.lastSittingEndsAt || null,
       rooms: roomsBy[String(e._id)] || 0,
       candidates: byExam[String(e._id)]?.candidates || 0,
       present: byExam[String(e._id)]?.present || 0,
@@ -118,12 +124,26 @@ const examSchema = z.object({
   startTime: z.string().regex(/^\d{2}:\d{2}$/, 'Choose a start time'),
   durationMinutes: z.number().int().min(10).max(360),
   totalMarks: z.number().min(1),
-  passMark: z.number().min(0),
+  /* Not `min(0)`. A cleared field arrives as 0, and a pass mark of
+     zero passes every candidate who turned up — the builder sends
+     `Number('') || 0`, so the paper looked configured. */
+  passMark: z.number().positive('Set a pass mark above zero'),
   blueprint: z.object({ sections: z.array(sectionSchema).min(1) }),
   proctoring: z.record(z.any()).optional(),
   randomisation: z.record(z.any()).optional(),
   instructions: z.string().optional(),
 });
+
+/* A pass mark nobody can reach is a paper that fails everyone, and
+   it reads as configured. Checked wherever either number moves. */
+function assertPassMarkIsReachable(exam) {
+  if (exam.passMark > exam.totalMarks) {
+    throw badRequest(
+      `The pass mark of ${exam.passMark} is above the paper's total of ${exam.totalMarks}`,
+      { passMark: 'No candidate could reach it' },
+    );
+  }
+}
 
 r.post('/', can('exam:create'), wrap(async (req, res) => {
   const body = parse(examSchema, req.body);
@@ -144,6 +164,7 @@ r.post('/', can('exam:create'), wrap(async (req, res) => {
       { blueprint: 'Adjust the section counts or the total marks so they agree' },
     );
   }
+  assertPassMarkIsReachable(exam);
   await exam.save();
 
   await audit(req, { action: 'exam.created', entity: 'Exam', entityId: exam._id, after: { code: body.code, date: body.date } });
@@ -175,6 +196,25 @@ r.patch('/:id', can('exam:edit'), wrap(async (req, res) => {
     const total = exam.blueprintTotal();
     if (total !== exam.totalMarks) {
       throw badRequest(`The blueprint adds up to ${total} marks but the paper is set to ${exam.totalMarks}`);
+    }
+  }
+  if (body.passMark || body.totalMarks || body.blueprint) assertPassMarkIsReachable(exam);
+
+  /* Moving the paper must not leave an alternate sitting standing
+     BEFORE it. "A sitting cannot begin before the examination" is
+     checked when the sitting is granted; without the same check here,
+     granting a 14:00 sitting on a 10:00 paper and then moving the
+     paper to 16:00 would hand that candidate the real question set
+     two hours before anyone else. */
+  if (body.date || body.startTime || body.timezone) {
+    const movedTo = examStartAt(exam);
+    const early = await Attempt.countDocuments({
+      examId: exam._id, ...tenant(req),
+      'sitting.startsAt': { $ne: null, $lt: movedTo },
+    });
+    if (early) {
+      throw badRequest(`${early} candidate(s) have a sitting arranged before the new start time. `
+        + 'Withdraw or re-time those sittings first, under Sittings.');
     }
   }
   await exam.save();
@@ -354,6 +394,113 @@ r.delete('/:examId/questions/:qid', can('question:delete'), wrap(async (req, res
   res.json({ ok: true });
 }));
 
+/* ============================================================
+   DRAWING FROM THE BANK
+
+   The paper takes a copy. A bank question edited or retired next term
+   must not alter a paper already sat, and the paper needs its own
+   order and set label. `sourceId` keeps the thread back so the bank
+   can show where a question has been used.
+   ============================================================ */
+r.post('/:id/questions/from-bank', can('question:create'), wrap(async (req, res) => {
+  const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) });
+  if (!exam) throw notFound('Examination not found');
+  if (['live', 'closed', 'evaluation', 'published'].includes(exam.status)) {
+    throw forbidden(`A ${exam.status} examination can no longer take new questions`);
+  }
+
+  const body = parse(z.object({
+    ids: z.array(z.string()).min(1).max(300),
+    setLabel: z.string().default('A'),
+  }), req.body);
+
+  const picked = await Question.find({
+    _id: { $in: body.ids }, ...tenant(req), examId: null, status: 'approved',
+  }).lean();
+
+  if (!picked.length) throw badRequest('None of those questions are in the bank and approved');
+
+  const wrongSubject = picked.filter((q) => String(q.subjectId) !== String(exam.subjectId));
+  if (wrongSubject.length) {
+    throw badRequest(`${wrongSubject.length} of those questions belong to another subject`);
+  }
+
+  /* The direct upload path validates every row against the blueprint.
+     This path inserts copies, so without the same check a bank
+     question could land in a Part that does not take its kind.
+
+     A mismatch of KIND is an error — a descriptive question cannot
+     sit in a multiple-choice part. A mismatch of MARKS is not: how
+     much a question is worth is a property of the paper's pattern,
+     not of the question, so the copy takes the Part's mark. */
+  const parts = new Map((exam.blueprint?.sections || []).map((s) => [s.key, s]));
+  const noPart = picked.filter((q) => !parts.has(q.section));
+  if (noPart.length) {
+    throw badRequest(`This paper has no Part ${[...new Set(noPart.map((q) => q.section))].join(', ')}`);
+  }
+  const wrongKind = picked.filter((q) => parts.get(q.section).type !== q.type);
+  if (wrongKind.length) {
+    const q = wrongKind[0];
+    throw badRequest(`Part ${q.section} of this paper takes ${parts.get(q.section).type} questions`
+      + `, but ${wrongKind.length} of those drawn ${wrongKind.length === 1 ? 'is' : 'are'} ${q.type}`);
+  }
+
+  /* Each part of the paper keeps its own numbering, continuing after
+     whatever is already there. */
+  const existing = await Question.find({ examId: exam._id, setLabel: body.setLabel })
+    .select('section order').lean();
+  const nextOrder = {};
+  for (const sec of ['A', 'B', 'C']) {
+    nextOrder[sec] = existing.filter((e) => e.section === sec)
+      .reduce((max, e) => Math.max(max, e.order + 1), 0);
+  }
+
+  /* The pattern is a ceiling, not a suggestion. The direct upload path
+     enforces it; without the same check here a second draw could put
+     fifteen questions into a Part of five — and nothing downstream
+     would catch it, because the publication check looks at rooms and
+     candidates, never at question counts. The candidate would then be
+     served all fifteen and could score three times the stated mark
+     for that Part. */
+  const drawnPerSection = {};
+  for (const q of picked) drawnPerSection[q.section] = (drawnPerSection[q.section] || 0) + 1;
+  for (const [sec, n] of Object.entries(drawnPerSection)) {
+    const already = existing.filter((e) => e.section === sec).length;
+    const allowed = parts.get(sec).count;
+    if (already + n > allowed) {
+      throw badRequest(`Part ${sec} takes ${allowed} question(s) and already has ${already}. `
+        + `Drawing ${n} more would make ${already + n}.`);
+    }
+  }
+
+  const copies = picked.map((q) => {
+    const { _id, createdAt, updatedAt, status, reviewedBy, reviewedAt, reviewNote,
+            submittedAt, usedCount, lastUsedAt, ...rest } = q;
+    return {
+      ...rest,
+      examId: exam._id,
+      sourceId: _id,
+      setLabel: body.setLabel,
+      order: nextOrder[q.section]++,
+      marks: parts.get(q.section).marksEach,
+      status: 'approved',
+    };
+  });
+
+  const made = await Question.insertMany(copies);
+  await Question.updateMany(
+    { _id: { $in: picked.map((q) => q._id) } },
+    { $inc: { usedCount: 1 }, $set: { lastUsedAt: new Date() } },
+  );
+
+  await audit(req, { action: 'exam.questions_from_bank', entity: 'Exam', entityId: exam._id,
+    after: { drawn: made.length, setLabel: body.setLabel } });
+
+  const counts = {};
+  for (const c of copies) counts[c.section] = (counts[c.section] || 0) + 1;
+  res.status(201).json({ drawn: made.length, bySection: counts });
+}));
+
 /* ============================ ROOMS & SCHEDULING ============================ */
 
 r.post('/:id/rooms/auto', can('schedule:create'), wrap(async (req, res) => {
@@ -485,11 +632,28 @@ async function collectConflicts(exam, institutionId) {
   // 3. invigilator already booked on another examination
   for (const room of rooms) {
     if (!room.invigilatorId) continue;
+
+    /* A room's window is the ordinary one. If candidates in it have
+       been given sittings of their own, the invigilator is needed
+       until the last of those ends — and a clash check that stopped
+       at the room's own endAt would happily double-book them for the
+       afternoon. */
+    const sittings = await Attempt.find({
+      roomId: room._id, 'sitting.startsAt': { $ne: null },
+    }).select('sitting').lean();
+
+    let watchUntil = new Date(room.endAt);
+    for (const a of sittings) {
+      const ends = new Date(new Date(a.sitting.startsAt).getTime()
+        + (a.sitting.durationMinutes || exam.durationMinutes) * 60000);
+      if (ends > watchUntil) watchUntil = ends;
+    }
+
     const clash = await Room.findOne({
       institutionId,
       examId: { $ne: exam._id },
       invigilatorId: room.invigilatorId._id,
-      startAt: { $lt: room.endAt },
+      startAt: { $lt: watchUntil },
       endAt: { $gt: room.startAt },
     }).populate('examId', 'title').lean();
     if (clash) {
@@ -546,6 +710,327 @@ async function collectConflicts(exam, institutionId) {
 
 /* ---------------- publish ----------------
    Creates one attempt per candidate and reserves licences. */
+/* ============================================================
+   ENDING A PAPER
+
+   "Hand in your papers." There was no way to say it, and a paper
+   nobody ends never ends: a candidate who shuts the laptop stays in
+   progress for ever, because their attempt is only auto-submitted
+   when their own browser next calls the API.
+
+   Open to the invigilator as well as the cell — the person standing
+   in the hall is the one who knows the paper is over.
+   ============================================================ */
+
+/* An invigilator may end the paper they are standing in front of —
+   and only that one.
+
+   `can('exam:edit', 'invigilation:edit')` is an OR, so without this
+   an invigilator assigned to one morning room could POST the id of
+   the afternoon paper and force-submit every candidate sitting it.
+   The preview is just as bad: it lists every candidate's name and
+   register number.
+
+   Someone holding `exam:edit` is the examination cell and is
+   institution-wide by design. */
+async function assertMayEndThisExam(req, exam) {
+  if (req.actor.permissions.has('exam:edit')) return;
+  if (req.actor.scope === 'institution') return;
+
+  const mine = await Room.countDocuments({
+    examId: exam._id, ...tenant(req), invigilatorId: req.actor.id,
+  });
+  if (!mine) {
+    throw forbidden('You are not invigilating this examination, so you cannot end it.');
+  }
+}
+
+/* What ending it now would do, before anyone commits to it. */
+r.get('/:id/close-preview', can('exam:edit', 'invigilation:edit'), wrap(async (req, res) => {
+  const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) }).lean();
+  if (!exam) throw notFound('Examination not found');
+  await assertMayEndThisExam(req, exam);
+
+  const writing = await Attempt.find({ examId: exam._id, ...tenant(req), status: 'in_progress' })
+    .populate('studentId', 'name regNo')
+    .populate('roomId', 'name')
+    .lean();
+
+  const at = new Date();
+  const seal = [];
+  const keep = [];
+
+  for (const a of writing) {
+    const allowed = mayContinue(a, exam, at);
+    const row = {
+      attemptId: String(a._id),
+      student: a.studentId ? { name: a.studentId.name, regNo: a.studentId.regNo } : null,
+      room: a.roomId?.name || null,
+      answered: (a.answers || []).filter((x) => x.selected?.length || (x.text || '').trim()
+        || (x.html || '').trim() || x.scanPages?.length).length,
+      timerEndsAt: a.timerEndsAt,
+    };
+    if (allowed.yes) keep.push({ ...row, why: allowed.why, until: allowed.until,
+                                 minutes: allowed.minutes || null });
+    else seal.push(row);
+  }
+
+  /* Split, because a candidate with a sitting arranged for this
+     afternoon is NOT absent — telling the cell they are is how a
+     paper gets ended out from under two people who were promised a
+     different time. */
+  const notYetStarted = await Attempt.find({
+    examId: exam._id, ...tenant(req), status: { $in: ['not_started', 'verifying'] },
+  }).populate('studentId', 'name regNo').select('sitting studentId').lean();
+
+  const dueLater = notYetStarted
+    .filter((a) => a.sitting?.startsAt && new Date(a.sitting.startsAt) > at)
+    .map((a) => ({
+      attemptId: String(a._id),
+      student: a.studentId ? { name: a.studentId.name, regNo: a.studentId.regNo } : null,
+      startsAt: a.sitting.startsAt,
+    }));
+  const notStarted = notYetStarted.length - dueLater.length;
+
+  res.json({
+    exam: {
+      id: String(exam._id), title: exam.title, code: exam.code, status: exam.status,
+      startsAt: examStartAt(exam), durationMinutes: exam.durationMinutes,
+      closedAt: exam.closedAt || null,
+    },
+    /* Three groups, because they are three different things and the
+       cell has to see which is which before pressing anything. */
+    willBeSealed: seal,
+    willKeepWriting: keep,
+    /* Arranged for later, and unaffected by ending the paper now. */
+    dueLater,
+    neverStarted: notStarted,
+  });
+}));
+
+r.post('/:id/close', can('exam:edit', 'invigilation:edit'), wrap(async (req, res) => {
+  const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) });
+  if (!exam) throw notFound('Examination not found');
+  await assertMayEndThisExam(req, exam);
+
+  /* Brought up to date first. The stored status only advances when
+     somebody loads a list, so a paper being sat right now can still
+     read 'scheduled' — and refusing to end it with "this examination
+     has not started" would be both wrong and baffling. */
+  const institution = await Institution.findById(req.actor.institutionId).lean();
+  await syncExamStatus(exam, institution);
+
+  if (['draft', 'scheduled'].includes(exam.status) && !exam.closedAt) {
+    throw badRequest('This examination has not started, so there is nothing to end. '
+      + 'Delete it, or move its date.');
+  }
+  if (exam.closedAt) {
+    throw badRequest(`This examination was already ended on `
+      + `${new Date(exam.closedAt).toLocaleString('en-GB')}.`);
+  }
+
+  const { reason } = parse(z.object({
+    reason: z.string().min(3, 'State why the paper is being ended').max(300),
+  }), req.body);
+
+  const result = await closeExam(exam, { actorId: req.actor.id, reason });
+
+  await audit(req, {
+    action: 'exam.closed', entity: 'Exam', entityId: exam._id,
+    after: { reason, sealed: result.sealed, stillWriting: result.continuing.length },
+  });
+
+  res.json({
+    ok: true,
+    sealed: result.sealed,
+    stillWriting: result.continuing.length,
+    /* Named, because "two candidates are still writing" is something
+       the invigilator has to act on — they are still being watched. */
+    continuing: result.continuing,
+    status: exam.status,
+  });
+}));
+
+/* ============================================================
+   ALTERNATE SITTINGS
+
+   The request, in the cell's own words: the paper runs 10:00 to
+   12:00, but two candidates are working professionals who can only
+   sit it between 14:00 and 16:00. Same examination, same paper, same
+   marks — a different window, for those two.
+
+   This is not the late-entry extension, which stretches the existing
+   window and still begins from the examination's own start. It
+   replaces the window for one candidate.
+   ============================================================ */
+
+/* Who is sitting this paper, and when. */
+r.get('/:id/sittings', can('exam:view', 'schedule:view'), wrap(async (req, res) => {
+  const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) })
+    .populate('subjectId', 'code title').lean();
+  if (!exam) throw notFound('Examination not found');
+
+  const attempts = await Attempt.find({ examId: exam._id, ...tenant(req) })
+    .populate('studentId', 'name regNo')
+    .populate('roomId', 'name')
+    .lean();
+
+  const ordinary = examStartAt(exam);
+
+  res.json({
+    exam: {
+      id: String(exam._id), title: exam.title, code: exam.code, status: exam.status,
+      date: exam.date, startTime: exam.startTime, timezone: exam.timezone,
+      durationMinutes: exam.durationMinutes,
+      startsAt: ordinary,
+      endsAt: ordinary ? new Date(ordinary.getTime() + exam.durationMinutes * 60000) : null,
+      alternateSittings: exam.alternateSittings || 0,
+    },
+    candidates: attempts.map((a) => {
+      const s = sittingFor(a, exam);
+      return {
+        attemptId: String(a._id),
+        student: a.studentId
+          ? { id: String(a.studentId._id), name: a.studentId.name, regNo: a.studentId.regNo }
+          : null,
+        room: a.roomId?.name || null,
+        status: a.status,
+        /* A candidate who has already begun cannot be moved: their
+           clock is running and their paper is open. */
+        movable: ['not_started', 'verifying'].includes(a.status),
+        sitting: s.isAlternate
+          ? {
+            startsAt: s.startAt, endsAt: s.endsAt,
+            durationMinutes: s.durationMinutes, reason: s.reason,
+            grantedAt: a.sitting?.grantedAt,
+          }
+          : null,
+      };
+    }).sort((x, y) => (x.student?.regNo || '').localeCompare(y.student?.regNo || '')),
+  });
+}));
+
+/* Grant, change or withdraw a sitting for one or more candidates. */
+r.post('/:id/sittings', can('schedule:edit', 'exam:edit'), wrap(async (req, res) => {
+  const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) });
+  if (!exam) throw notFound('Examination not found');
+  if (['closed', 'evaluation', 'published'].includes(exam.status)) {
+    throw forbidden(`A ${exam.status} examination can no longer be re-timed`);
+  }
+
+  const body = parse(z.object({
+    attemptIds: z.array(z.string()).min(1, 'Choose at least one candidate'),
+    /* Absent means withdraw the sitting and put them back in the
+       examination's own window. */
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a date like 2026-10-08').optional(),
+    startTime: z.string().regex(/^\d{2}:\d{2}$/, 'Use a time like 14:00').optional(),
+    durationMinutes: z.number().int().min(5).max(600).optional(),
+    reason: z.string().min(5, 'State why this sitting is arranged').max(500).optional(),
+  }), req.body);
+
+  const withdrawing = !body.date || !body.startTime;
+
+  const attempts = await Attempt.find({
+    _id: { $in: body.attemptIds }, examId: exam._id, ...tenant(req),
+  });
+  if (attempts.length !== new Set(body.attemptIds).size) {
+    throw badRequest('One of those candidates is not sitting this examination');
+  }
+
+  /* A candidate already writing cannot be re-timed: the clock is
+     running and the paper is open in front of them. */
+  const started = attempts.filter((a) => !['not_started', 'verifying'].includes(a.status));
+  if (started.length) {
+    throw badRequest(`${started.length} of those have already started or finished.`
+      + ' Their sitting cannot be changed.');
+  }
+
+  let startsAt = null;
+  let duration = exam.durationMinutes;
+
+  if (!withdrawing) {
+    if (!body.reason) throw badRequest('State why this sitting is arranged');
+    const zone = exam.timezone || DEFAULT_TIMEZONE;
+    startsAt = zonedToUtc(body.date, body.startTime, zone);
+    if (!startsAt) throw badRequest('That date and time could not be read');
+    duration = body.durationMinutes || exam.durationMinutes;
+
+    /* A sitting before the paper itself opens would hand the
+       questions out early. */
+    const ordinary = examStartAt(exam);
+    if (ordinary && startsAt < ordinary) {
+      throw badRequest('A sitting cannot begin before the examination itself. '
+        + 'The paper is sealed until then.');
+    }
+  }
+
+  const update = withdrawing
+    ? { $unset: { sitting: '' } }
+    : {
+      $set: {
+        sitting: {
+          startsAt,
+          durationMinutes: duration,
+          reason: body.reason,
+          grantedBy: req.actor.id,
+          grantedAt: new Date(),
+        },
+      },
+    };
+
+  /* The status filter is repeated IN the write, not only in the check
+     above. A candidate who presses Start between the read and the
+     write would otherwise end up in progress with a future sitting —
+     and `/start` refuses a paper whose sitting has not begun, so they
+     would be locked out of their own open paper while its clock ran
+     down to an auto-submit. */
+  const result = await Attempt.updateMany({
+    _id: { $in: attempts.map((a) => a._id) }, ...tenant(req),
+    status: { $in: ['not_started', 'verifying'] },
+  }, update);
+
+  /* Not an error — the rest were changed. But silence here would
+     leave the cell believing a candidate was re-timed when they were
+     not, because they pressed Start a moment before the write. */
+  const skipped = attempts.length - result.matchedCount;
+  if (skipped > 0) {
+    await audit(req, { action: 'exam.sitting_partial', entity: 'Exam', entityId: exam._id,
+      after: { requested: attempts.length, changed: result.matchedCount } });
+  }
+
+  /* The paper has to know how far its sittings now reach, or it files
+     itself under past papers while someone is still writing. */
+  const withSittings = await Attempt.find({
+    examId: exam._id, ...tenant(req), 'sitting.startsAt': { $ne: null },
+  }).select('sitting').lean();
+
+  const ends = withSittings.map((a) => new Date(
+    new Date(a.sitting.startsAt).getTime()
+    + (a.sitting.durationMinutes || exam.durationMinutes) * 60000,
+  ));
+  exam.alternateSittings = withSittings.length;
+  exam.lastSittingEndsAt = lastSittingEnd(exam, ends);
+  await recomputeWritingUntil(exam);
+  await exam.save();
+
+  await audit(req, {
+    action: withdrawing ? 'exam.sitting_withdrawn' : 'exam.sitting_granted',
+    entity: 'Exam', entityId: exam._id,
+    after: { candidates: attempts.length, date: body.date, startTime: body.startTime,
+             durationMinutes: duration, reason: body.reason },
+  });
+
+  res.json({
+    ok: true,
+    changed: result.matchedCount,
+    skippedBecauseStarted: skipped,
+    withdrawn: withdrawing,
+    startsAt,
+    endsAt: startsAt ? new Date(startsAt.getTime() + duration * 60000) : null,
+    alternateSittings: exam.alternateSittings,
+  });
+}));
+
 r.post('/:id/publish', can('exam:publish', 'schedule:publish'), wrap(async (req, res) => {
   const exam = await Exam.findOne({ _id: req.params.id, ...tenant(req) });
   if (!exam) throw notFound('Examination not found');

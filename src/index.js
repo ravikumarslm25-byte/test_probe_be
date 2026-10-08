@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 
 import { env, isProd } from './config/env.js';
 import { connectDb } from './config/db.js';
@@ -27,6 +28,8 @@ import evaluationRoutes from './routes/evaluation.routes.js';
 import reportRoutes from './routes/report.routes.js';
 import ticketRoutes from './routes/ticket.routes.js';
 import scheduleRoutes from './routes/schedule.routes.js';
+import qbankRoutes from './routes/qbank.routes.js';
+import uploadRoutes from './routes/upload.routes.js';
 
 const app = express();
 
@@ -36,7 +39,29 @@ const app = express();
    per-address rate limit lumps together everyone on the same edge. */
 app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(cors({ origin: env.corsOrigins, credentials: true }));
+/* Handing cors an array means an unlisted origin is refused in
+   silence: no header is added, nothing is logged, and the request is
+   still handled. The browser then reports "No Access-Control-Allow-
+   Origin header is present", which reads like a fault in the service
+   and sends everyone looking in the wrong place. Naming the refused
+   origin, once per origin, turns hours of guesswork into one line. */
+const refusedOrigins = new Set();
+app.use(cors({
+  credentials: true,
+  origin(origin, cb) {
+    // same-origin requests, curl and health checks send no origin
+    if (!origin) return cb(null, true);
+    if (env.corsOrigins.includes(origin)) return cb(null, true);
+
+    if (!refusedOrigins.has(origin)) {
+      refusedOrigins.add(origin);
+      console.warn(`[cors] refused "${origin}" — it is not in CORS_ORIGINS.`);
+      console.warn(`[cors] permitted: ${env.corsOrigins.join(', ') || '(none)'}`);
+      console.warn('[cors] the browser will report this as a missing header, not as a refusal.');
+    }
+    return cb(null, false);          // no header; never throws
+  },
+}));
 app.use(express.json({ limit: '25mb' }));   // identity captures and scan pages arrive as data URLs
 app.use(cookieParser());
 app.use(morgan(isProd ? 'combined' : 'dev'));
@@ -54,6 +79,13 @@ const rateKey = (req) => {
   return `ip:${req.ip}`;
 };
 
+/* Answer uploads are mounted BEFORE the general limiter, because they
+   do not fit it. The phone carries no token, so every upload in the
+   hall would be keyed on one campus address and the three hundredth
+   candidate would be refused. The route brings its own limiter, keyed
+   on the single-use pass instead. */
+app.use('/api/uploads', uploadRoutes);
+
 app.use('/api', rateLimit({
   windowMs: 60 * 1000,
   limit: (req) => (rateKey(req).startsWith('u:') ? 600 : 300),
@@ -68,11 +100,32 @@ if (process.env.STORAGE_DRIVER !== 's3') {
   app.use('/uploads', express.static(storageRoot, { maxAge: '1h', index: false }));
 }
 
-app.get('/api/health', (_req, res) => res.json({
-  ok: true, service: 'testprobe', version: '0.1.0',
-  time: new Date().toISOString(),
-  live: liveStats(),
-}));
+/* Health answers for the database too, not just the process. A reply of
+   ok: true while queries are failing sends whoever is debugging in the
+   wrong direction, and an uptime monitor would never notice the outage.
+   A replica-set election can leave a long-running driver pointed at a
+   former primary; this reports it and 503 tells a monitor to act. */
+app.get('/api/health', async (_req, res) => {
+  const started = Date.now();
+  const state = mongoose.STATES[mongoose.connection.readyState];
+  let database = { ok: false, state };
+  if (mongoose.connection.readyState !== 1) {
+    database.error = `not connected to MongoDB (${state})`;
+  } else {
+    try {
+      await mongoose.connection.db.admin().command({ ping: 1 });
+      database = { ...database, ok: true, pingMs: Date.now() - started };
+    } catch (e) {
+      database.error = e.message.slice(0, 200);
+    }
+  }
+  res.status(database.ok ? 200 : 503).json({
+    ok: database.ok, service: 'testprobe', version: '0.1.0',
+    time: new Date().toISOString(),
+    database,
+    live: liveStats(),
+  });
+});
 
 app.use('/api/auth', authRoutes);
 app.use('/api/institution', institutionRoutes);
@@ -85,6 +138,7 @@ app.use('/api/evaluation', evaluationRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/schedule', scheduleRoutes);
+app.use('/api/qbank', qbankRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
@@ -150,6 +204,7 @@ const start = async () => {
   await backfillExamInstants();
   const server = app.listen(env.port, () => {
     console.log(`[api] Test Probe listening on http://localhost:${env.port}/api`);
+    console.log(`[api] browser origins permitted: ${env.corsOrigins.join(', ')}`);
   });
   attachRealtime(server);
 };

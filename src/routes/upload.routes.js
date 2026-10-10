@@ -20,7 +20,9 @@
 import { Router } from 'express';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
-import { Attempt, Exam, UploadPass } from '../models/exam.js';
+import { Attempt, Exam, Question, UploadPass } from '../models/exam.js';
+import { assertChoiceAllows } from '../services/choiceGuard.js';
+import { hasContent } from '../utils/grading.js';
 import { Student } from '../models/core.js';
 import { wrap, notFound, badRequest, forbidden } from '../utils/http.js';
 import { storage, evidenceKey, validateUpload } from '../services/storage.js';
@@ -157,6 +159,40 @@ r.post('/:token',
       throw badRequest(`This code accepts ${pass.maxFiles} files, and all of them have been used.`);
     }
 
+    /* Everything that can refuse this page is asked BEFORE the file
+       is stored and before the pass is spent.
+
+       Done after, a refusal still wrote the object into storage,
+       still counted against the pass's six files, and still appeared
+       on the phone's own list — so a candidate saw "1 file uploaded"
+       against an answer that held nothing, and six refusals killed
+       the pass without ever attaching anything. */
+    const attempt = await Attempt.findById(pass.attemptId);
+    if (!attempt) throw notFound('That upload has expired');
+
+    /* Checked here and not only when the pass was loaded: that check
+       ran before the body was buffered, and photographing and
+       uploading a page over a phone connection takes seconds in which
+       the examination can end. */
+    if (attempt.status !== 'in_progress') {
+      throw forbidden('The examination has ended, so this page cannot be added to the answer.');
+    }
+
+    /* The paper's choice rule holds on the phone too. A pass issued
+       while the question was open stays valid for fifteen minutes,
+       and in that time the candidate may have answered its
+       alternative on the examination machine. */
+    const examDoc = await Exam.findById(pass.examId).lean();
+    const question = await Question.findById(pass.questionId).lean();
+    if (examDoc && question) {
+      await assertChoiceAllows(attempt, examDoc, question, {
+        wasAnswered: hasContent(attempt.answers.find(
+          (a) => String(a.questionId) === String(pass.questionId),
+        )),
+        willBeAnswered: true,
+      });
+    }
+
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
     const buffer = Buffer.isBuffer(req.body) ? req.body : null;
     if (!buffer || !buffer.length) throw badRequest('No file arrived. Choose the file again.');
@@ -196,21 +232,6 @@ r.post('/:token',
     /* Written onto the answer immediately rather than when the
        candidate closes the dialog — a phone that uploads and then
        loses signal must not lose the page. */
-    const attempt = await Attempt.findById(pass.attemptId);
-
-    /* Checked again here, not only when the pass was loaded.
-       Photographing and uploading a page over a phone connection
-       takes seconds, and the examination can end inside them — the
-       pass check ran before the body was buffered and before the file
-       was stored. A page landing after the paper was sealed attached
-       an unmarked descriptive answer to a script whose result had
-       already been decided, and the evaluator could no longer touch
-       it. The file is already in storage and harmless; the answer is
-       not written. */
-    if (attempt.status !== 'in_progress') {
-      throw forbidden('The examination has ended, so this page cannot be added to the answer.');
-    }
-
     let answer = attempt.answers.find((a) => String(a.questionId) === String(pass.questionId));
     if (!answer) {
       attempt.answers.push({ questionId: pass.questionId, section: pass.section });
@@ -250,6 +271,11 @@ r.post('/:token',
       section: pass.section,
       questionNumber: pass.questionNumber,
       files: pass.files.map((f) => ({ name: f.name, mime: f.mime, bytes: f.bytes })),
+      /* The count on the ANSWER, which is what makes the question
+         read as answered on the examination screen. The file list
+         above belongs to this pass alone and undercounts an answer
+         that was uploaded to across two passes. */
+      answerPages: (answer.scanPages || []).length,
     });
 
     res.status(201).json({

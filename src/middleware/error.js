@@ -21,6 +21,16 @@ export function errorHandler(err, _req, res, _next) {
   if (err?.name === 'CastError') {
     return res.status(400).json({ error: `Invalid ${err.path}` });
   }
+  /* Two writes to the same attempt at once, and the second lost.
+     Returned as a conflict rather than a 500 so the client retries
+     against the document as it now stands — which is what makes the
+     choice rule hold when a candidate's machine sends two answers in
+     the same instant. */
+  if (err?.name === 'VersionError') {
+    return res.status(409).json({
+      error: 'That answer was being saved from somewhere else at the same moment. Try again.',
+    });
+  }
 
   const status = err.status || 500;
   if (status >= 500) console.error('[error]', err);

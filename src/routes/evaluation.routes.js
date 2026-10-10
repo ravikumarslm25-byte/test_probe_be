@@ -11,6 +11,7 @@ import { storage } from '../services/storage.js';
 import { applyBestN } from '../utils/grading.js';
 import { sanitiseAnswerHtml, stripTags } from '../utils/sanitise.js';
 import { decidePass } from '../services/finalise.js';
+import { choiceLabel, countedAnswers } from '../utils/choice.js';
 
 const r = Router();
 r.use(authenticate);
@@ -428,6 +429,15 @@ r.get('/attempts/:id', can('evaluation:view'), wrap(async (req, res) => {
         page: p.page, url: await storage.urlFor(p.key),
         mime: p.mime || 'image/jpeg', name: p.name, bytes: p.bytes,
       }))),
+      /* Pages the candidate took off the answer to type instead.
+         Shown to the evaluator rather than quietly dropped: a
+         candidate who removed their pages by mistake and ran out of
+         time would otherwise score zero with nothing anywhere to say
+         they had uploaded anything at all. */
+      removedScanUrls: await Promise.all((a.removedScanPages || []).map(async (p) => ({
+        page: p.page, url: await storage.urlFor(p.key),
+        mime: p.mime || 'image/jpeg', name: p.name, bytes: p.bytes,
+      }))),
       keywords: q.keywords,
       modelAnswer: q.modelAnswer,
       markingGuidance: q.markingGuidance,
@@ -457,6 +467,14 @@ r.get('/attempts/:id', can('evaluation:view'), wrap(async (req, res) => {
       title: exam.title, code: exam.code,
       totalMarks: exam.totalMarks, passMark: exam.passMark,
       sections: exam.blueprint.sections,
+      /* Which choice rule this paper was set under. The evaluator
+         needs it: on an either/or paper a blank question is the
+         alternative the candidate did not take, not an answer they
+         failed to give. */
+      choiceRule: (() => {
+        const d = exam.blueprint.sections.find((x) => x.type === 'desc');
+        return d ? choiceLabel(d, questions.filter((q) => q.section === d.key)) : null;
+      })(),
     },
     answers: items.filter(Boolean),
   });
@@ -523,7 +541,14 @@ function recomputeTotals(attempt, exam, byId) {
       const q = byId.get(String(a.questionId));
       return q?.section === descSection.key;
     });
-    applyBestN(descAnswers, descSection.answerCount || descAnswers.length);
+    /* The paper's own rule decides how many count — the same number
+       the examination screen enforced. `answerCount` alone was a
+       different number on an either/or paper, and marking by it threw
+       away answers the candidate had been required to give. */
+    const descQuestions = [...byId.values()]
+      .filter((q) => q.section === descSection.key)
+      .sort((x, y) => (x.order ?? 0) - (y.order ?? 0));
+    applyBestN(descAnswers, countedAnswers(descSection, descQuestions) || descAnswers.length);
   }
 
   const totals = {};

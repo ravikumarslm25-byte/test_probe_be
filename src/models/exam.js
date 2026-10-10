@@ -13,7 +13,15 @@ const blueprintSection = new Schema({
   type:  { type: String, enum: ['mcq', 'fib', 'desc'], required: true },
   count:       { type: Number, required: true },   // questions set
   marksEach:   { type: Number, required: true },
-  answerCount: { type: Number },                   // best-N counted; desc only
+  answerCount: { type: Number },                   // how many are counted; desc only
+  /* HOW the candidate chooses, which is not the same question as how
+     many they answer:
+       best_n     answer as many as you like, the best N count
+       any_n      answer any N — and only N; the rest close
+       either_or  questions stand in pairs; one from each pair
+     Defaulted to best_n so papers set before this existed keep
+     behaving exactly as they did. New papers are built as any_n. */
+  choiceMode: { type: String, enum: ['best_n', 'any_n', 'either_or'], default: 'best_n' },
   instruction: String,
 }, { _id: false });
 
@@ -106,7 +114,13 @@ examSchema.index({ institutionId: 1, date: 1, status: 1 });
 // paper being scheduled that cannot add up to the stated marks.
 examSchema.methods.blueprintTotal = function () {
   return (this.blueprint?.sections || []).reduce((sum, s) => {
-    const counted = s.type === 'desc' ? (s.answerCount || s.count) : s.count;
+    /* An either/or section is marked out of one answer per pair,
+       whatever `answerCount` happens to hold — the questions are not
+       loaded here, so the pairing is derived from the count, which is
+       what the builder enforces. */
+    const counted = s.type !== 'desc' ? s.count
+      : s.choiceMode === 'either_or' ? Math.ceil(s.count / 2)
+      : (s.answerCount || s.count);
     return sum + counted * s.marksEach;
   }, 0);
 };
@@ -140,6 +154,11 @@ const questionSchema = new Schema({
   type:      { type: String, enum: ['mcq', 'fib', 'desc'], required: true },
   order:     { type: Number, default: 0 },
   setLabel:  { type: String, default: 'A' },
+  /* Which questions stand against each other under `either_or`. Only
+     equality matters — two questions sharing a group are alternatives
+     and the candidate answers one of them. Empty on every other kind
+     of paper. */
+  choiceGroup: String,
 
   text:  { type: String, required: true },
   marks: { type: Number, required: true },
@@ -227,6 +246,10 @@ const answerSchema = new Schema({
      and the evaluator's viewer has to know not to render it in an
      <img>. Older rows have no mime and are images by definition. */
   scanPages: [{ key: String, page: Number, uploadedAt: Date, mime: String, bytes: Number, name: String }],
+  /* Pages the candidate took off this answer to type instead. Kept
+     rather than deleted: they are a record of what was uploaded
+     during the examination, and that is not a candidate's to erase. */
+  removedScanPages: [{ key: String, page: Number, uploadedAt: Date, mime: String, bytes: Number, name: String }],
   mode: { type: String, enum: ['typed', 'scanned', 'mixed'], default: 'typed' },
   markedForReview: { type: Boolean, default: false },
   answeredAt: Date,

@@ -11,6 +11,7 @@
    So it lives here, and all three call it.
    ============================================================ */
 import { Question } from '../models/exam.js';
+import { countedAnswers } from '../utils/choice.js';
 import {
   gradeMcq, gradeFib, suggestDescriptive, applyBestN, hasContent,
 } from '../utils/grading.js';
@@ -101,14 +102,21 @@ export async function gradeObjective(attempt, exam) {
     }
   }
 
-  // best-N across the descriptive section
+  /* Best-N across the descriptive section.
+
+     The number counted is the number the paper's own choice rule
+     allows, not the stored `answerCount` — on an either/or paper
+     those are two different numbers, and marking by the second
+     discarded answers the first had demanded. */
   const descSection = exam.blueprint.sections.find((s) => s.type === 'desc');
   if (descSection) {
+    const descQuestions = questions.filter((q) => q.section === descSection.key)
+      .sort((x, y) => (x.order ?? 0) - (y.order ?? 0));
     const descAnswers = attempt.answers.filter((x) => {
       const q = byId.get(String(x.questionId));
       return q?.type === 'desc';
     });
-    applyBestN(descAnswers, descSection.answerCount || descAnswers.length);
+    applyBestN(descAnswers, countedAnswers(descSection, descQuestions) || descAnswers.length);
   }
 
   attempt.marks.sectionA = Math.round(a * 100) / 100;

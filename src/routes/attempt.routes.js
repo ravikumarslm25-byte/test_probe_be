@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import QRCode from 'qrcode';
 import { Exam, Question, Room, Attempt, UploadPass } from '../models/exam.js';
-import { Institution } from '../models/core.js';
+import { Institution, Student } from '../models/core.js';
 import { authenticate, studentOnly, tenant } from '../middleware/auth.js';
 import { wrap, notFound, badRequest, forbidden, conflict } from '../utils/http.js';
 import { parse } from '../utils/validate.js';
@@ -14,6 +14,8 @@ import { storage, evidenceKey, decodeDataUrl, validateUpload } from '../services
 import { pushToWatchers } from '../realtime/live.js';
 import { formatInZone } from '../utils/time.js';
 import { sittingFor } from '../utils/sitting.js';
+import { choiceLabel } from '../utils/choice.js';
+import { assertChoiceAllows } from '../services/choiceGuard.js';
 import { env } from '../config/env.js';
 import { sanitiseAnswerHtml } from '../utils/sanitise.js';
 import { finaliseAttempt, gradeObjective } from '../services/finalise.js';
@@ -69,6 +71,7 @@ function sanitiseQuestion(q, exam) {
     order: q.order,
     text: q.text,
     marks: q.marks,
+    choiceGroup: q.choiceGroup,
   };
   if (q.type === 'mcq') {
     let options = (q.options || []).map((o) => ({ key: o.key, text: o.text }));
@@ -98,6 +101,49 @@ function shuffleWithSeed(arr, seed) {
 /* ============================================================
    MY EXAMINATIONS
    ============================================================ */
+/* ============================================================
+   WHO THE CANDIDATE IS
+
+   The portal shows them their own record — the one the examination
+   cell holds, and the one printed on their hall ticket. A candidate
+   who finds their department or class wrong here can raise it before
+   the examination rather than at the door.
+
+   Read-only on purpose. A candidate correcting their own register
+   number is not a feature.
+   ============================================================ */
+r.get('/me/profile', wrap(async (req, res) => {
+  const me = await Student.findById(req.actor.id)
+    .populate('batchId', 'label year section programme')
+    .populate('departmentId', 'name code')
+    .lean();
+  if (!me) throw notFound('Your record could not be found');
+
+  const sat = await Attempt.countDocuments({
+    studentId: me._id, status: { $in: ['submitted', 'terminated'] },
+  });
+  const published = await Attempt.countDocuments({
+    studentId: me._id, resultPublishedAt: { $ne: null },
+  });
+
+  res.json({
+    student: {
+      name: me.name,
+      regNo: me.regNo,
+      email: me.email,
+      mobile: me.mobile || null,
+      status: me.status,
+      department: me.departmentId ? { name: me.departmentId.name, code: me.departmentId.code } : null,
+      batch: me.batchId ? {
+        label: me.batchId.label, year: me.batchId.year,
+        section: me.batchId.section, programme: me.batchId.programme,
+      } : null,
+      joinedAt: me.createdAt,
+    },
+    counts: { sat, published },
+  });
+}));
+
 r.get('/mine', wrap(async (req, res) => {
   const attempts = await Attempt.find({ studentId: req.actor.id, ...tenant(req) })
     .populate('examId')
@@ -378,6 +424,8 @@ r.post('/:id/start', wrap(async (req, res) => {
     return {
       key: s.key, title: s.title, type: s.type,
       marksEach: s.marksEach, answerCount: s.answerCount,
+      choiceMode: s.choiceMode || 'best_n',
+      choiceLabel: s.type === 'desc' ? choiceLabel(s, qs) : null,
       instruction: s.instruction,
       questions: qs.map((q) => sanitiseQuestion(q, exam)),
     };
@@ -439,6 +487,7 @@ r.patch('/:id/answers/:questionId', wrap(async (req, res) => {
   }), req.body);
 
   let answer = attempt.answers.find((a) => String(a.questionId) === String(question._id));
+  const wasAnswered = hasContent(answer);
   if (!answer) {
     answer = { questionId: question._id, section: question.section };
     attempt.answers.push(answer);
@@ -465,6 +514,17 @@ r.patch('/:id/answers/:questionId', wrap(async (req, res) => {
   if (body.markedForReview !== undefined) answer.markedForReview = body.markedForReview;
   answer.answeredAt = now();
 
+  await assertChoiceAllows(attempt, exam, question, {
+    wasAnswered, willBeAnswered: hasContent(answer),
+  });
+
+  /* Forces the version into the update's filter, so two answers
+     written in the same instant cannot both win. Without it, the two
+     halves of an either/or pair could each be saved by a request that
+     had not seen the other — and the rule then stops enforcing that
+     pair at all, because neither answer can be identified as the
+     one that came first. */
+  attempt.increment();
   await attempt.save();
 
   res.json({
@@ -724,6 +784,17 @@ r.post('/:id/scan-pages/:questionId', wrap(async (req, res) => {
   if (!question) throw notFound('Question not found');
   if (question.type !== 'desc') throw badRequest('Only descriptive answers accept a scan');
 
+  /* Checked BEFORE a single byte is stored. Below the store loop it
+     was checked after as many as twelve files had been written, which
+     left them orphaned in storage attached to nothing — and the
+     comment there claimed the opposite. */
+  await assertChoiceAllows(attempt, exam, question, {
+    wasAnswered: hasContent(attempt.answers.find(
+      (a) => String(a.questionId) === String(question._id),
+    )),
+    willBeAnswered: true,
+  });
+
   const stored = [];
   for (const [i, dataUrl] of pages.entries()) {
     const decoded = decodeDataUrl(dataUrl);
@@ -768,7 +839,46 @@ r.post('/:id/scan-pages/:questionId', wrap(async (req, res) => {
   if (win) win.pages = stored.length;
 
   await attempt.save();
-  res.json({ ok: true, pages: stored.length });
+  res.json({ ok: true, pages: stored.length, answerPages: answer.scanPages.length });
+}));
+
+/* Taking the pages off again.
+
+   An answer is EITHER typed OR handwritten — the client's rule, and a
+   sound one: an evaluator opening a script should not have to work
+   out whether the typed paragraph or the photographed page is the
+   real answer, or mark both. So the examination screen locks the
+   editor once pages are attached, and this is the way back out of
+   that: remove the pages, and the editor is editable again.
+
+   The files themselves are left in storage. They are evidence that
+   the candidate uploaded something during the examination, and a
+   deletion a candidate can trigger is not evidence anyone should be
+   able to destroy. The answer simply stops pointing at them. */
+r.delete('/:id/scan-pages/:questionId', wrap(async (req, res) => {
+  const { attempt, exam } = await loadAttempt(req, { requireActive: true });
+
+  /* A closed section is closed for this too. Without the check, the
+     one route that can take an answer apart was the one route that
+     did not ask whether the section was still open. */
+  const question = await Question.findOne({ _id: req.params.questionId, examId: exam._id }).lean();
+  if (!question) throw notFound('Question not found');
+  if (attempt.sectionState.lockedSections.includes(question.section)) {
+    throw forbidden('That part of the paper is closed');
+  }
+
+  const answer = attempt.answers.find((a) => String(a.questionId) === String(req.params.questionId));
+  if (!answer || !(answer.scanPages || []).length) {
+    throw badRequest('There are no pages attached to this answer');
+  }
+
+  const removed = answer.scanPages.length;
+  answer.removedScanPages = [...(answer.removedScanPages || []), ...answer.scanPages];
+  answer.scanPages = [];
+  answer.mode = 'typed';
+  await attempt.save();
+
+  res.json({ ok: true, removed });
 }));
 
 /* ============================================================
@@ -784,6 +894,18 @@ r.post('/:id/scan-pages/:questionId', wrap(async (req, res) => {
    address inside it, uploads there, and the examination page is told
    over its own live socket. The candidate never leaves the paper.
    ============================================================ */
+/* How many pages the ANSWER holds, which is not how many this pass
+   delivered. A candidate who sends three pages, closes the dialog and
+   opens it again gets a fresh pass carrying none — and the
+   examination page, told only about the pass, would conclude the
+   answer had no pages and quietly mark the question unanswered
+   again. Every reply that the page uses to update itself carries the
+   answer's own count. */
+function answerPageCount(attempt, questionId) {
+  const a = (attempt.answers || []).find((x) => String(x.questionId) === String(questionId));
+  return (a?.scanPages || []).length;
+}
+
 r.post('/:id/upload-pass', wrap(async (req, res) => {
   const { attempt, exam } = await loadAttempt(req, { requireActive: true });
   const { questionId } = parse(z.object({ questionId: z.string() }), req.body);
@@ -795,6 +917,13 @@ r.post('/:id/upload-pass', wrap(async (req, res) => {
   if (!exam.proctoring?.mobileScan) {
     throw forbidden('This paper must be answered on screen; uploading is not enabled for it');
   }
+
+  /* Refused before the code is drawn, rather than after the candidate
+     has photographed four pages on their phone. */
+  const held = attempt.answers.find((a) => String(a.questionId) === String(question._id));
+  await assertChoiceAllows(attempt, exam, question, {
+    wasAnswered: hasContent(held), willBeAnswered: true,
+  });
 
   /* A pass already open for this question is handed back rather than
      reissued, so a candidate who closes the dialog and reopens it
@@ -834,6 +963,7 @@ r.post('/:id/upload-pass', wrap(async (req, res) => {
                                         errorCorrectionLevel: 'M' }),
     expiresAt: pass.expiresAt,
     files: (pass.files || []).length,
+    answerPages: answerPageCount(attempt, question._id),
     maxFiles: pass.maxFiles,
     questionNumber: pass.questionNumber,
   });
@@ -854,6 +984,7 @@ r.get('/:id/upload-pass/:token', wrap(async (req, res) => {
     files: (pass.files || []).map((f) => ({
       name: f.name, mime: f.mime, bytes: f.bytes, uploadedAt: f.uploadedAt,
     })),
+    answerPages: answerPageCount(attempt, pass.questionId),
     closed: Boolean(pass.closedAt),
     expiresAt: pass.expiresAt,
   });
@@ -872,7 +1003,11 @@ r.post('/:id/upload-pass/:token/close', wrap(async (req, res) => {
     && String(w.questionId) === String(pass.questionId));
   if (win) { win.closedAt = now(); await attempt.save(); }
 
-  res.json({ ok: true, files: (pass.files || []).length });
+  res.json({
+    ok: true,
+    files: (pass.files || []).length,
+    answerPages: answerPageCount(attempt, pass.questionId),
+  });
 }));
 
 /* ============================================================

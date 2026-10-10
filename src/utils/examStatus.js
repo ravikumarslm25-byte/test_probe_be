@@ -25,12 +25,31 @@ const WORKFLOW_DRIVEN = ['draft', 'closed', 'evaluation', 'published'];
 
 /* A document carries what the status is derived from only if it was
    loaded with those fields. `undefined` from a narrow projection and
-   `undefined` from an empty column are indistinguishable, so the
-   check is on the presence of the KEY, which a projection omits and
-   a Mongoose document always has. */
+   `undefined` from a field that was never set are indistinguishable
+   on a lean object, so this asks a different question: is this the
+   whole document?
+
+   The first version asked whether `writingUntil`, `lastSittingEndsAt`
+   and `closedAt` were present, and that was wrong in the worst way.
+   None of the three is ever written until a sitting is granted or the
+   paper is ended by hand, and MongoDB does not store a field that was
+   never set — so `.lean()` returns an ordinary new paper WITHOUT
+   those keys. Every such paper looked like a narrow projection and
+   was left alone, which froze it on "Scheduled" through its own
+   examination and past the end of it: candidates sat the paper, wrote
+   it, submitted, and the list still read Scheduled the next morning
+   while the wall said "Not started yet". Nothing was swept either,
+   because the sweep only runs for a paper the sync has moved.
+
+   `timestamps: true` is what makes the question answerable. Every
+   stored exam has `createdAt` and `updatedAt`; a projection does not,
+   unless it asked for them. So: a full document, or a lean one
+   carrying its timestamps, is the whole paper. Anything else must
+   name the three fields itself to be trusted. */
 export function hasStatusFields(exam) {
   if (!exam) return false;
   if (typeof exam.toObject === 'function') return true;      // a full document
+  if ('createdAt' in exam || 'updatedAt' in exam) return true;   // a whole lean document
   return ['writingUntil', 'lastSittingEndsAt', 'closedAt'].every((k) => k in exam);
 }
 

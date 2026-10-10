@@ -111,7 +111,34 @@ const sectionSchema = z.object({
   count: z.number().int().min(1),
   marksEach: z.number().min(0.5),
   answerCount: z.number().int().min(1).optional(),
+  choiceMode: z.enum(['best_n', 'any_n', 'either_or']).optional(),
   instruction: z.string().optional(),
+}).superRefine((s, ctx) => {
+  /* A paper that cannot be answered as written is caught here rather
+     than discovered by a candidate in a hall. */
+  if (s.answerCount != null && s.answerCount > s.count) {
+    ctx.addIssue({ code: 'custom', path: ['answerCount'],
+      message: `Part ${s.key} sets ${s.count} question(s); it cannot ask for ${s.answerCount} answers` });
+  }
+  if (s.choiceMode && s.choiceMode !== 'best_n' && s.type !== 'desc') {
+    ctx.addIssue({ code: 'custom', path: ['choiceMode'],
+      message: 'A choice rule applies to a descriptive part only' });
+  }
+  if (s.choiceMode === 'either_or') {
+    if (s.count % 2 !== 0) {
+      /* An odd question out has no alternative, so it is compulsory —
+         on a paper whose own instruction says "answer one from each
+         pair". The rule handles an existing odd paper by widening the
+         last pair; a new one is simply refused. */
+      ctx.addIssue({ code: 'custom', path: ['count'],
+        message: `Part ${s.key} pairs its questions, so it needs an even number of them` });
+    }
+    const pairs = Math.ceil(s.count / 2);
+    if (s.answerCount != null && s.answerCount !== pairs) {
+      ctx.addIssue({ code: 'custom', path: ['answerCount'],
+        message: `Part ${s.key} has ${pairs} pair(s), so it takes exactly ${pairs} answer(s)` });
+    }
+  }
 });
 
 const examSchema = z.object({
@@ -200,6 +227,29 @@ r.patch('/:id', can('exam:edit'), wrap(async (req, res) => {
   }
   if (body.passMark || body.totalMarks || body.blueprint) assertPassMarkIsReachable(exam);
 
+  /* Pairing a paper that was not built paired.
+
+     Questions drawn from the bank are grouped at the moment they are
+     drawn — but only if the part was already set to either/or. A cell
+     that writes the questions first and chooses the rule afterwards
+     (which is the ordinary way round) would otherwise have a paper
+     with no pairing at all and nowhere to set one. Stamped here, in
+     the order the questions are set: 1 with 2, 3 with 4. */
+  if (body.blueprint) {
+    for (const sec of exam.blueprint.sections) {
+      if (sec.type !== 'desc' || sec.choiceMode !== 'either_or') continue;
+      const qs = await Question.find({ examId: exam._id, section: sec.key })
+        .sort({ order: 1 }).select('_id order choiceGroup').lean();
+      const writes = qs
+        .map((q, i) => ({ q, want: String(Math.floor((q.order ?? i) / 2) + 1) }))
+        .filter(({ q, want }) => q.choiceGroup !== want)
+        .map(({ q, want }) => ({
+          updateOne: { filter: { _id: q._id }, update: { $set: { choiceGroup: want } } },
+        }));
+      if (writes.length) await Question.bulkWrite(writes, { ordered: false });
+    }
+  }
+
   /* Moving the paper must not leave an alternate sitting standing
      BEFORE it. "A sitting cannot begin before the examination" is
      checked when the sitting is granted; without the same check here,
@@ -255,6 +305,9 @@ const questionSchema = z.object({
   marks: z.number().min(0.5),
   order: z.number().int().default(0),
   setLabel: z.string().default('A'),
+  /* Which question this one stands against under an either/or
+     section. Two questions sharing it are alternatives. */
+  choiceGroup: z.string().max(40).optional(),
   options: z.array(z.object({ key: z.string(), text: z.string() })).optional(),
   correctOptions: z.array(z.string()).optional(),
   multiSelect: z.boolean().optional(),
@@ -476,13 +529,21 @@ r.post('/:id/questions/from-bank', can('question:create'), wrap(async (req, res)
   const copies = picked.map((q) => {
     const { _id, createdAt, updatedAt, status, reviewedBy, reviewedAt, reviewNote,
             submittedAt, usedCount, lastUsedAt, ...rest } = q;
+    const order = nextOrder[q.section]++;
+    const part = parts.get(q.section);
     return {
       ...rest,
       examId: exam._id,
       sourceId: _id,
       setLabel: body.setLabel,
-      order: nextOrder[q.section]++,
-      marks: parts.get(q.section).marksEach,
+      order,
+      /* Drawn into an either/or part, a question is paired with its
+         neighbour — "1 or 2, 3 or 4", which is what the phrase means.
+         The cell can repair the pairing in the builder; this is only
+         the sensible opening position. A bank question's own group,
+         if it somehow has one, is not carried into a paper. */
+      choiceGroup: part?.choiceMode === 'either_or' ? String(Math.floor(order / 2) + 1) : undefined,
+      marks: part.marksEach,
       status: 'approved',
     };
   });

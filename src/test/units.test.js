@@ -10,11 +10,12 @@
    ============================================================ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import { validateUpload } from '../services/storage.js';
 import { sniff, cleanName } from '../routes/upload.routes.js';
 import { zonedToUtc, utcToZoned, examStartAt } from '../utils/time.js';
-import { dueStatus } from '../utils/examStatus.js';
+import { dueStatus, hasStatusFields } from '../utils/examStatus.js';
 import { sanitiseAnswerHtml, stripTags } from '../utils/sanitise.js';
 import { sittingFor, lastSittingEnd } from '../utils/sitting.js';
 import {
@@ -560,4 +561,80 @@ test('a disqualified candidate is not passed by the marks they had collected', (
     true,
     'and an ordinary paper being sealed is unaffected',
   );
+});
+
+/* ============================================================
+   IS THIS THE WHOLE PAPER, OR A PROJECTION OF IT?
+
+   The guard that answers this froze an examination on "Scheduled"
+   through its own sitting and past the end of it: three candidates
+   sat the paper, submitted, and the list still read Scheduled the
+   next morning while Live monitoring said "Not started yet".
+
+   The reason is that `writingUntil`, `lastSittingEndsAt` and
+   `closedAt` are only written when a sitting is granted or the paper
+   is ended by hand. Until then MongoDB does not store those keys at
+   all, and `.lean()` hands back exactly what is stored — so a
+   perfectly complete, ordinary paper looked like a narrow projection
+   and was left alone for ever.
+   ============================================================ */
+test('an ordinary paper that has never had a sitting or been closed is recognised', () => {
+  /* What `.lean()` actually returns for a new paper: no closedAt, no
+     writingUntil, no lastSittingEndsAt, because none was ever set. */
+  const lean = {
+    _id: 'e1', code: 'BAM754', status: 'scheduled',
+    date: '2026-10-08', startTime: '13:30', durationMinutes: 120,
+    timezone: 'Asia/Kolkata', startsAt: new Date('2026-10-08T08:00:00.000Z'),
+    passMark: 20, totalMarks: 50, blueprint: { sections: [] },
+    createdAt: new Date(), updatedAt: new Date(),
+  };
+  assert.equal(hasStatusFields(lean), true,
+    'this is the whole document; the status must be allowed to follow the clock');
+});
+
+test('a paper that has finished moves on, rather than sitting on Scheduled', () => {
+  const lean = {
+    code: 'BAM754', status: 'scheduled', durationMinutes: 120,
+    startsAt: new Date('2026-10-08T08:00:00.000Z'),      // 13:30 IST
+    createdAt: new Date(), updatedAt: new Date(),
+  };
+  assert.equal(hasStatusFields(lean), true);
+  assert.equal(dueStatus(lean, { at: new Date('2026-10-09T05:06:00.000Z') }), 'evaluation',
+    'the next morning it is over, whatever it still says');
+});
+
+test('a genuinely narrow projection is still refused', () => {
+  /* The failure this guard exists for: a status derived from a
+     document that does not carry what it is derived from, and then
+     WRITTEN BACK — past correction, because evaluation is
+     workflow-driven. A projection has no timestamps unless asked. */
+  const projected = { _id: 'e1', code: 'BAM754', status: 'live', durationMinutes: 120 };
+  assert.equal(hasStatusFields(projected), false);
+});
+
+test('a projection that deliberately carries the status fields is accepted', () => {
+  const widened = {
+    _id: 'e1', code: 'BAM754', status: 'live', durationMinutes: 120,
+    writingUntil: null, lastSittingEndsAt: null, closedAt: null,
+  };
+  assert.equal(hasStatusFields(widened), true);
+});
+
+test('the invigilation projection still carries everything the status needs', () => {
+  /* This projection has now been the cause twice — once missing
+     `blueprint`, once missing `passMark` — and both times the symptom
+     was somewhere else entirely: a wrong status written back, or a
+     cohort sealed with an undecidable result. It has no timestamps,
+     so it is trusted only because it names the status fields itself.
+     Narrow it and this test says so. */
+  const src = readFileSync(new URL('../routes/invigilation.routes.js', import.meta.url), 'utf8');
+  const m = src.match(/\.populate\(\s*'examId',([\s\S]*?)\)\s*\n/);
+  assert.ok(m, 'the rooms query no longer populates examId the way this test expects');
+  const fields = m[1];
+  for (const need of ['status', 'date', 'startTime', 'durationMinutes', 'timezone', 'startsAt',
+    'blueprint', 'passMark', 'writingUntil', 'lastSittingEndsAt', 'closedAt']) {
+    assert.ok(new RegExp(`\\b${need}\\b`).test(fields),
+      `the invigilator's rooms query no longer loads '${need}' — the status derived from it`
+      + ' would be wrong, and it is written back');
+  }
 });
